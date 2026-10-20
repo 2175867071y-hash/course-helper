@@ -1,0 +1,30 @@
+# Local state and credentials
+.env
+.env.*
+!.env.example
+data/
+profiles/
+browser_profiles/
+user_data/
+settings.json
+tasks.json
+*.sqlite*
+*.db
+*.log
+*.key
+*.pem
+
+# Python and build output
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
+# Workspace-only files
+.codex-remote-attachments/
+work/

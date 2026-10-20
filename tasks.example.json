@@ -1,0 +1,22 @@
+{
+  "tasks": [
+    {
+      "id": "my-chaoxing-course",
+      "platform": "chaoxing",
+      "url": "https://i.chaoxing.com/",
+      "max_chapters": 30
+    },
+    {
+      "id": "my-mooc-course",
+      "platform": "mooc",
+      "url": "https://www.icourse163.org/",
+      "max_chapters": 30
+    },
+    {
+      "id": "my-uai-course",
+      "platform": "uai",
+      "url": "https://ucloud.unipus.cn/",
+      "max_chapters": 0
+    }
+  ]
+}
