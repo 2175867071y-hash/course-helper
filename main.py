@@ -10,6 +10,7 @@ import time
 
 from browser import Adapter, ManualRequired, only_one, page_identity
 from core import Monitor, Store, validate_url
+from dom_read import safe_error_location
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -203,11 +204,11 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
             except (EOFError, KeyboardInterrupt):
                 return 'q'
             except Exception as exc:
-                # 异常消息可能含签名 URL；日志只打印异常类型。
+                # 异常消息可能含签名 URL；仅保留本项目文件名、行号和函数。
                 if adapter.page.is_closed():
                     logging.warning('课程窗口已关闭，进度保留到最后一次观测。')
                     return 'q'
-                choice = manual(f'页面读取或操作失败（{type(exc).__name__}），请检查网络和页面。')
+                choice = manual(f'页面读取或操作失败（{safe_error_location(exc)}），请检查页面后继续。')
                 if choice != 'r':
                     return choice
                 monitor = Monitor(stall_seconds=stall)

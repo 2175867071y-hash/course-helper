@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
+from dom_read import is_loading_error
 
 
 # 同一结构可用于不同站点；没有语义目录时，由用户在网页中定位。
@@ -97,6 +98,7 @@ const customCatalogs = () => {
 """
 
 CATALOG_JS = 'rule => {' + DOM_HELPERS + r"""
+if (!document.body) return [];
 if (rule) {
   const roots=[...document.querySelectorAll(rule.root)].filter(visible);
   return roots.map(root=>describe(root,rule.items,rule.selection)).filter(Boolean);
@@ -110,6 +112,7 @@ return semantic.length ? semantic : customCatalogs();
 }"""
 
 CONTENT_JS = r"""exclude => {
+  if (!document.body) return {busy:true,content:[]};
   const visible=e=>e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
   const candidates=[...document.querySelectorAll('main,[role=main],article')].filter(visible);
   const roots=candidates.filter(e=>!candidates.some(n=>n!==e && n.contains(e)));
@@ -341,11 +344,17 @@ class Navigator:
         while self.pending:
             if self.adapter.control:
                 self.adapter.control.check()
-            reason = self.adapter.guard(include_course=False)
-            if reason:
-                self.fail(reason)
-            if self.ready():
-                return
+            try:
+                reason = self.adapter.guard(include_course=False)
+                if reason:
+                    self.fail(reason)
+                if self.ready():
+                    return
+            except Exception as exc:
+                if not is_loading_error(exc):
+                    raise
+                # 只重读切换结果，保留 pending，不能再次点击下一项。
+                self.pending.update(seen=None)
             if time.monotonic() >= deadline:
                 self.fail('已点击下一项，但尚未确认正文或播放器更新。请检查加载状态后继续；不会重复点击。')
             if self.adapter.control:

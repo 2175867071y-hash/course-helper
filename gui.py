@@ -220,7 +220,7 @@ class App:
         self.prompt_id = None
         self.closing = False
         self.settings_window = None
-        self.root.title('网课助手 · 1.6.3')
+        self.root.title('网课助手 · 1.6.4')
         self.root.geometry('900x820')
         self.root.minsize(820, 780)
         self.root.configure(bg='#F3F5F8')
@@ -846,17 +846,27 @@ def main():
             assert 'self-test-synthetic-speech-key' not in (Path(directory) / 'settings.json').read_text(
                 encoding='utf-8')
             import quiz_media, quiz_drag, quiz_speech
+            from quiz_ocr import read_text
             from playwright.sync_api import sync_playwright
             with sync_playwright() as playwright:
                 assert playwright.chromium.name == 'chromium'
+                browser = playwright.chromium.launch(channel='msedge', headless=True)
+                page = browser.new_page()
+                page.set_content('<p style="font:28px Microsoft YaHei;width:600px">语音识别（ASR）</p>')
+                recognized = read_text(page.locator('p'))
+                assert '语音识别' in recognized and 'ASR' in recognized
+                page.set_content('<span style="font:16px Microsoft YaHei">错</span>')
+                assert read_text(page.locator('span')) == '错'
+                browser.close()
             store = Store(Path(directory) / 'progress.sqlite3')
             assert store.rows() == []
             store.close()
-            Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'tk': tk.TkVersion,
+            Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'version': '1.6.4', 'tk': tk.TkVersion,
                                                    'playwright_driver': True,
                                                    'api_key_encryption': True,
                                                    'speech_key_encryption': True,
                                                    'multimedia_modules': True,
+                                                   'windows_ocr': True,
                                                    'background_settings': True,
                                                    'sqlite': True}), encoding='utf-8')
         root.destroy()

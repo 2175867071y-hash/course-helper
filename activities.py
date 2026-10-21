@@ -11,7 +11,8 @@ from quiz_ai import QuizAIError, solve_questions
 from quiz_drag import DragBinding, drag_prompt, is_drag_group, fill_drag, verify_drag
 from quiz_dom import (FillBinding, discover_question_groups, task_identity, fill_text, prompt_text,
                       read_quiz, verify_fill, option_text as _option_text,
-                      visible_options as _visible_options, quiz_scope)
+                      visible_options as _visible_options, quiz_result_scope, option_checked)
+from dom_read import retry_dom_read
 
 
 DOC_SELECTOR = '#viewerContainer, .pdfViewer, [role=document], .document-viewer, .reader-container'
@@ -123,6 +124,7 @@ class CourseActivities:
                 roots.append(root)
         return roots
 
+    @retry_dom_read
     def _detect(self):
         identity = self._page_context()
         frames = self.adapter.visible_frames()
@@ -399,7 +401,8 @@ class CourseActivities:
         return 'working'
 
     def _read_quiz(self, item):
-        return read_quiz(item, multimedia=bool(self.vision_model or self.speech_model))
+        return read_quiz(item, multimedia=bool(self.vision_model or self.speech_model),
+                         check=self._check, progress=self._emit)
 
     def _fill_answers(self, bindings, answers):
         for answer in answers:
@@ -415,7 +418,7 @@ class CourseActivities:
             for index, (option, target) in enumerate(options):
                 expected = index in selected
                 role = option.get_attribute('role')
-                checked = option.get_attribute('aria-checked') == 'true' if role else option.is_checked()
+                checked = option_checked(option)
                 if checked == expected:
                     continue
                 if not expected and (role or option.get_attribute('type')) == 'radio':
@@ -426,9 +429,7 @@ class CourseActivities:
             self._verify_selection(options, selected)
 
     def _verify_selection(self, options, selected):
-        actual = [index for index, (option, _) in enumerate(options)
-                  if (option.get_attribute('aria-checked') == 'true'
-                      if option.get_attribute('role') else option.is_checked())]
+        actual = [index for index, (option, _) in enumerate(options) if option_checked(option)]
         if actual != sorted(selected):
             raise ManualRequired('网页未保留完整选项，请检查答案，不会自动提交。')
 
@@ -445,7 +446,7 @@ class CourseActivities:
         # 捕获当前测验的作用域；题目移除后仍可看原容器的结果，容器被替换则等待人工核对。
         try:
             if item.success_scope is None:
-                scope = quiz_scope(item)
+                scope = quiz_result_scope(item)
                 section = item.root[0].locator('xpath=ancestor::section[1]')
                 if section.count() == 1 and all(section.evaluate('(e,c)=>e.contains(c)', group.element_handle())
                                                 for group in item.root):

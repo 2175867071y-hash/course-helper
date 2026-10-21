@@ -6,6 +6,7 @@ from browser import ManualRequired
 from quiz_ai import QuizBlank, QuizQuestion
 from quiz_drag import is_drag_group, read_drag, SOURCES, TARGETS
 from quiz_media import collect_media, references, media_nodes
+from quiz_ocr import read_text as ocr_text
 
 
 QUESTION_GROUPS = 'fieldset, .TiMu, .question-item, .questionLi, [data-question-id]'
@@ -204,9 +205,52 @@ def option_text(option):
     return option.evaluate("""e => {
         const labels = e.labels ? Array.from(e.labels) : [];
         return labels.map(l => l.innerText).join(' ').trim() ||
-            e.getAttribute('aria-label') || e.innerText ||
+            e.innerText || e.getAttribute('aria-label') ||
             (e.closest('li') ? e.closest('li').innerText : '');
     }""").strip()
+
+
+def option_checked(option):
+    if not option.get_attribute('role'):
+        return option.is_checked()
+    state = option.get_attribute('aria-checked')
+    if state in ('true', 'false'):
+        return state == 'true'
+    # 超星将圆圈/方框的可见选中样式放在 span 上，没有 aria-checked。
+    if option.evaluate("e=>e.matches('li[role=radio],li[role=checkbox]') && "
+                       "!!e.closest('.TiMu') && "
+                       "e.querySelectorAll('.num_option,.num_option_dx').length===1"):
+        return option.locator('.num_option,.num_option_dx').evaluate(
+            "e=>e.classList.contains('check_answer') || e.classList.contains('check_answer_dx')")
+    raise ManualRequired('选项没有可核验的选中状态，请手动处理，不会重复点击。')
+
+
+def visual_choice_text(group, choices, check=lambda: None):
+    """只在已观察到的超星文字区域做 OCR；不抓整页或猜测字形映射。"""
+    encoded = group.locator('.font-cxsecret').evaluate_all("""nodes => nodes.some(e=>
+        e.getClientRects().length && getComputedStyle(e).fontFamily.includes('font-cxsecret'))""")
+    if not encoded:
+        return None
+    title = group.locator('.Zy_TItle .fontLabel')
+    if not group.evaluate("e=>e.matches('.TiMu')") or title.count() != 1 or len(choices) < 2:
+        raise ManualRequired('识别到特殊字体，但题干或选项区域尚未适配，请手动处理。')
+    regions = [title]
+    for option, _ in choices:
+        text = option.locator('a.after')
+        if text.count() != 1 or not text.is_visible():
+            raise ManualRequired('特殊字体选项缺少完整文字区域，请手动处理。')
+        regions.append(text)
+    for region in regions:
+        if region.locator('img,svg,canvas,audio,video,input,textarea,select').count():
+            raise ManualRequired('特殊字体题目混合了非文字材料，请手动核对，不会只识别部分内容。')
+        _material_text(region)
+    result = []
+    for region in regions:
+        check()
+        result.append(ocr_text(region))
+    if PERSONAL.search(' '.join(result)):
+        raise ManualRequired('识别到个人经历或自评题，请按实际情况填写。')
+    return result[0], result[1:]
 
 
 def prompt_text(group, ids=None):
@@ -235,6 +279,13 @@ def prompt_text(group, ids=None):
 
 
 def quiz_scope(item):
+    # 超星的提交确认/验证码对话框在表单外；仅把题目所属表单作为试卷。
+    # 仍检查表单内隐藏题和未识别控件，避免忽略未完成的题目。
+    if all(group.evaluate("e=>e.matches('.TiMu') && !!e.closest('.ZyBottom')") for group in item.root):
+        form = item.root[0].locator('xpath=ancestor::form[1]')
+        if form.count() == 1 and form.is_visible() and all(form.evaluate(
+                '(e,c)=>e.contains(c)', group.element_handle()) for group in item.root):
+            return form
     for selector in ('xpath=ancestor::*[@role="dialog"][1]',
                      'xpath=ancestor::*[self::main or @role="main"][1]'):
         container = item.root[0].locator(selector)
@@ -243,6 +294,17 @@ def quiz_scope(item):
                    for group in item.root):
                 return container
     return item.frame.locator('body')
+
+
+def quiz_result_scope(item):
+    scope = quiz_scope(item)
+    if scope.evaluate("e=>e.tagName==='FORM' && !!e.querySelector('.ZyBottom')"):
+        container = scope.locator('xpath=ancestor::*[contains(concat(" ",normalize-space(@class)," ")," RightCon ")'
+                                  ' and contains(concat(" ",normalize-space(@class)," ")," newTestCon ")][1]')
+        if (container.count() == 1 and container.is_visible()
+                and container.locator('form:visible').count() == 1):
+            return container
+    return scope
 
 
 def _same_node(first, second):
@@ -435,7 +497,7 @@ def _blank(control, identity):
             BlankBinding(identity, control, kind, values))
 
 
-def read_quiz(item, multimedia=False):
+def read_quiz(item, multimedia=False, check=lambda: None, progress=lambda message: None):
     scope = quiz_scope(item)
     notice = personal_notice(item, scope)
     if notice:
@@ -445,6 +507,7 @@ def read_quiz(item, multimedia=False):
     context, bank, reuse, bank_groups = shared_materials(item, scope)
     questions, bindings = [], []
     for index, group in enumerate(item.root):
+        check()
         group_context = '\n\n'.join(part for part in (context, table_context(group)) if part)
         if is_drag_group(group):
             question, binding = read_drag(group, index, group_context, mapping)
@@ -454,6 +517,9 @@ def read_quiz(item, multimedia=False):
             continue
         choices = visible_options(group)
         controls = [control for control in group.locator(TEXT_SELECTOR).all() if control.is_visible()]
+        if group.locator('.font-cxsecret').count():
+            progress(f'正在读取小测第 {index + 1} / {len(item.root)} 题：本机文字识别')
+        visual = visual_choice_text(group, choices, check)
         if choices and controls:
             raise ManualRequired('同一道题混合了选择与填空控件，尚不能可靠对应，请手动处理。')
         if controls:
@@ -466,7 +532,7 @@ def read_quiz(item, multimedia=False):
         else:
             if len(choices) < 2:
                 raise ManualRequired('未能完整识别题目选项或输入空格，请手动处理。')
-            texts = [option_text(option) for option, _ in choices]
+            texts = visual[1] if visual else [option_text(option) for option, _ in choices]
             for number, (option, target) in enumerate(choices):
                 refs = references(target, mapping)
                 refs += [identity for media, identity in mapping if identity not in refs and option.evaluate(
@@ -481,7 +547,9 @@ def read_quiz(item, multimedia=False):
             if kind == 'single' and len(texts) == 2 and normalized in (
                     {'true', 'false'}, {'正确', '错误'}, {'对', '错'}, {'√', '×'}):
                 kind = 'truefalse'
-            prompt = prompt_text(group)
+            prompt = visual[0] if visual else prompt_text(group)
+            if visual:
+                group_context += '\n题干与选项由本机 OCR 从可见文字识别，可能有误差；不能确定时降低置信度。'
             question = QuizQuestion(str(index), kind, prompt, texts, context=group_context)
             binding = choices
         question.images, question.audio = media[index]

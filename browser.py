@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from core import VideoState, validate_url, detect_platform
 from navigation import Navigator, NavigationTarget
+from dom_read import retry_dom_read
 
 
 class ManualRequired(RuntimeError):
@@ -188,6 +189,7 @@ class Adapter:
                 result.append(frame)
         return result
 
+    @retry_dom_read
     def videos(self):
         result = []
         identity = self.content_identity()
@@ -228,6 +230,7 @@ class Adapter:
         except ValueError:
             raise ManualRequired('下一项地址离开了当前课程站点，请在浏览器中确认后重新添加课程。') from None
 
+    @retry_dom_read
     def guard(self, include_course=True):
         if self.dialog_pending:
             return '浏览器出现弹窗，请手动处理后继续。'
