@@ -120,6 +120,24 @@ class NavigationDOMTests(unittest.TestCase):
         self.assertNotEqual(course.identity(), old)
         self.assertEqual(self.page.evaluate('window.clicks'), 1)
 
+    def test_detached_frame_during_transition_retries_read_without_reclick(self):
+        from playwright.sync_api import Error
+        self.load()
+        nav = self.adapter.navigator
+        self.adapter.next_control().click()
+        ready = nav.ready
+        calls = []
+        def interrupted_read():
+            calls.append(True)
+            if len(calls) == 1:
+                raise Error('Execution context was destroyed')
+            return ready()
+        with patch.object(nav, 'ready', side_effect=interrupted_read):
+            nav.wait_ready(2)
+        self.assertIsNone(nav.pending)
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(self.page.evaluate('window.clicks'), 1)
+
     def test_highlight_only_does_not_count_as_success_and_is_not_clicked_twice(self):
         from activities import CourseActivities
         self.load(change=False)
