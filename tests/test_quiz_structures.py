@@ -95,7 +95,7 @@ class StructuredQuizTests(unittest.TestCase):
     def test_changed_table_header_discards_ai_answer(self):
         self.load_uai('<table><tr><th>Present tense</th><th>Answer</th></tr>'
                       '<tr><td>1. She (go) to school.</td><td><input></td></tr></table>')
-        def answer(questions, *_):
+        def answer(questions, *_, report=None):
             self.page.locator('th').first.evaluate("e=>e.textContent='Past tense'")
             return [SimpleNamespace(id='0', selected=[], filled={'q0_b0': 'goes'})]
         with patch('activities.solve_questions', side_effect=answer):
@@ -151,7 +151,7 @@ class StructuredQuizTests(unittest.TestCase):
                       '<tr><th>Verb</th><th>Answer</th></tr><tr><td>go</td><td><input></td></tr></table>',
                       'Complete the table.')
         self.assertIn('Write the past tense', self.questions()[0].context)
-        def answer(questions, *_):
+        def answer(questions, *_, report=None):
             self.page.locator('caption').evaluate("e=>e.textContent='Write the present participle.'")
             return [SimpleNamespace(id='0', selected=[], filled={'q0_b0': 'went'})]
         with patch('activities.solve_questions', side_effect=answer):
@@ -224,7 +224,7 @@ class StructuredQuizTests(unittest.TestCase):
 
     def test_same_url_task_switch_discards_inflight_answers(self):
         self.load_uai('<p>1. Answer <input>.</p>')
-        def switch(questions, *_):
+        def switch(questions, *_, report=None):
             self.page.locator('.pc-task').evaluate_all('es=>{es[0].className="pc-task";'
                 'es[1].className="pc-task pc-header-task-activity";}')
             return [SimpleNamespace(id='0', selected=[], filled={'q0_b0': 'word'})]

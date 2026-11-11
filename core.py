@@ -1,3 +1,6 @@
+# 课程视频常要求真实用户手势才允许播放；这个 Chromium 开关解除限制。
+BROWSER_ARGS = ('--autoplay-policy=no-user-gesture-required',)
+
 """播放观察状态机与 SQLite 本地记录，不写入平台完成状态。"""
 
 from dataclasses import asdict, dataclass
@@ -19,6 +22,17 @@ class VideoState:
     ended: bool
     ready: int = 4
     error: int = 0
+    playback_rate: float = 1.0
+
+
+def validate_playback_rate(value):
+    if type(value) not in (int, float) or not 1 <= value <= 4 or not math.isfinite(value):
+        raise ValueError('视频倍速须为 1 到 4 之间的数字。')
+    return float(value)
+
+
+def valid_media_rate(value):
+    return type(value) in (int, float) and 0.25 <= value <= 4 and math.isfinite(value)
 
 
 def validate_url(url: str, platform: str) -> str:
@@ -76,7 +90,7 @@ class Monitor:
     """返回下一步建议；manual 一经触发，仅新建实例可以恢复。
 
     now 应传入 time.monotonic()。仅初始暂停允许一次 start；播放结束
-    需要看到正常速度的进度变化。finished 只代表本次播放器自然结束。
+    需要看到符合实际倍速的进度变化。finished 只代表本次播放器自然结束。
     """
 
     PAUSED_REASON = "视频已暂停或首次播放未成功，请手动处理"
@@ -101,15 +115,19 @@ class Monitor:
                 or not math.isfinite(now) or now < self._clock):
             raise ValueError("只能恢复已确认的普通暂停")
         if (state.key != self._key or state.ended or state.error
+                or not valid_media_rate(state.playback_rate)
                 or not math.isfinite(state.current) or not math.isfinite(state.duration)
                 or state.current < 0 or state.current > state.duration + 0.75
                 or abs(state.duration - self._duration) > max(1.0, self._duration * 0.01)
                 or state.current < self._last_time - 0.25
-                or state.current - self._last_time > (now - self._clock) * 1.05 + 0.75):
+                or state.current - self._last_time > (now - self._clock) *
+                    max(self._last_rate, state.playback_rate) * 1.05 + 0.75):
             raise ValueError("等待焦点期间视频进度异常，请确认页面")
         self._locked = False
         self._clock = self._last_sample = self._anchor_clock = self._progress_at = now
         self._anchor_time = self._last_time = state.current
+        self._anchor_budget = 0.0
+        self._last_rate = state.playback_rate
         self._saw_playing = self._saw_playing or not state.paused
 
     def _begin(self, key: str, now: float) -> None:
@@ -118,10 +136,13 @@ class Monitor:
         self._last_sample = None
         self._anchor_time = None
         self._anchor_clock = None
+        self._anchor_budget = 0.0
+        self._last_rate = None
         self._duration = None
         self._progress_at = now
         self._progressed = False
         self._start_requested = False
+        self._start_retries = 0
         self._saw_playing = False
         self._finished = False
 
@@ -139,6 +160,8 @@ class Monitor:
         if state.key != self._key:
             self._begin(state.key, now)
         self._clock = now
+        if not valid_media_rate(state.playback_rate):
+            return self._manual('播放器倍速无效或超出 0.25 到 4 倍范围，请检查页面')
         if self._finished:
             self.reason = "已报告本次自然播放结束，等待下一节"
             return "wait"
@@ -150,13 +173,21 @@ class Monitor:
             return self._manual("当前媒体可能为直播，无法自动判断自然结束")
         if math.isnan(state.duration) or state.duration <= 0:
             if state.ready < 1 and (math.isnan(state.duration) or state.duration == 0):
-                if now - self._progress_at >= self.stall_seconds:
+                # preload=none 的播放器常见；超过 45 秒仍未加载就转人工，避免空等满 90 秒。
+                if now - self._progress_at >= min(self.stall_seconds, 45):
                     return self._manual("视频仍未加载，请在网页手动点击播放；开始播放后选择继续")
-                if state.paused and not self._start_requested and not self._saw_playing:
+                if state.paused and not self._saw_playing:
                     # preload=none 的播放器需要先点击播放才会加载时长。
-                    self._start_requested = True
-                    self.reason = "正在尝试启动播放器并加载视频"
-                    return "start"
+                    if not self._start_requested:
+                        self._start_requested = True
+                        self.reason = "正在尝试启动播放器并加载视频"
+                        return "start"
+                    if self._start_retries < 2 and now - self._progress_at >= 15:
+                        # 第一次启动没唤醒播放器时，隔一段时间再请求一次加载。
+                        self._start_retries += 1
+                        self._progress_at = now
+                        self.reason = "视频仍未加载，正在重新请求播放器加载"
+                        return "start"
                 self._saw_playing = self._saw_playing or not state.paused
                 self.reason = "等待视频元数据"
                 return "wait"
@@ -171,9 +202,13 @@ class Monitor:
         if self._anchor_time is None:
             self._anchor_time = state.current
             self._anchor_clock = now
-        elif state.current - self._anchor_time > (now - self._anchor_clock) * 1.05 + 0.75:
-            # 总进度也要与真实时间匹配，避免每次采样容差不断累积。
-            return self._manual("累计播放进度超过正常速度，请手动确认进度")
+        else:
+            # 速度改变发生在两次采样之间，使用两端较大值给该区间留出余量。
+            # 累计预算不因变速重置，固定采样容差不能反复累积成跳时。
+            self._anchor_budget += (now - self._last_sample) * max(
+                self._last_rate, state.playback_rate)
+            if state.current - self._anchor_time > self._anchor_budget * 1.05 + 0.75:
+                return self._manual('累计播放进度超过实际倍速，请手动确认进度')
         if self._last_time is not None:
             elapsed = now - self._last_sample
             if elapsed >= self.stall_seconds:
@@ -182,13 +217,14 @@ class Monitor:
             if advance < -0.25:
                 return self._manual("检测到播放时间倒退，请手动确认进度")
             # 为采样与浏览器定时器留出少量容差，不把大幅跳时视为播放。
-            if advance > elapsed * 1.25 + 0.75:
+            if advance > elapsed * max(self._last_rate, state.playback_rate) * 1.25 + 0.75:
                 return self._manual("检测到播放时间异常跳变，请手动确认进度")
             if advance > 0.01:
                 self._progressed = True
                 self._progress_at = now
         self._last_time = state.current
         self._last_sample = now
+        self._last_rate = state.playback_rate
         if state.ended:
             if not self._progressed or not self._saw_playing:
                 return self._manual("首次观察已结束或未观察到播放进度，请手动确认")
@@ -210,9 +246,16 @@ class Monitor:
             self.reason = "播放器正在缓冲，等待恢复"
             return "wait"
         if state.paused:
+            if (not self._saw_playing and self._start_retries < 3
+                    and now - self._progress_at >= 3):
+                # 播放器已加载却仍暂停：隔 3 秒再尝试播放，最多三次。
+                self._start_retries += 1
+                self._progress_at = now
+                self.reason = "播放器仍暂停，正在再次尝试播放"
+                return "start"
             return self._manual(self.PAUSED_REASON)
         self._saw_playing = True
-        self.reason = "正在观察正常播放进度"
+        self.reason = f'正在观察播放进度（实际 {state.playback_rate:g} 倍速）'
         return "wait"
 
 
@@ -236,7 +279,26 @@ class Store:
                 PRIMARY KEY (task_id, video_key)
             )
         """)
+        self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS course_pages (
+                task_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL
+            )
+        """)
         self._connection.commit()
+
+    def _record_page(self, task_id, url):
+        self._connection.execute("""
+            INSERT INTO course_pages (task_id, url) VALUES (?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET url = excluded.url
+            WHERE course_pages.url != excluded.url
+        """, (task_id, url))
+
+    def save_page(self, task_id: str, url: str):
+        if urlsplit(url).username is not None:
+            raise ValueError("本地记录不接受包含账号或密码的 URL")
+        with self._connection:
+            self._record_page(task_id, url)
 
     def save(self, task_id: str, url: str, state: VideoState, status: str):
         """只保存收到的观测字段，不补造播放时间或课程完成结果。"""
@@ -258,8 +320,14 @@ class Store:
                     updated_at = excluded.updated_at,
                     revision = excluded.revision
             """, (task_id, state.key, url, snapshot, status, stamp))
+            self._record_page(task_id, url)
 
     def resume_url(self, task_id: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT url FROM course_pages WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is not None:
+            return row["url"]
         row = self._connection.execute("""
             SELECT url FROM observations WHERE task_id = ?
             ORDER BY revision DESC LIMIT 1

@@ -245,9 +245,13 @@ def visual_choice_text(group, choices, check=lambda: None):
             raise ManualRequired('特殊字体题目混合了非文字材料，请手动核对，不会只识别部分内容。')
         _material_text(region)
     result = []
-    for region in regions:
+    for number, region in enumerate(regions):
         check()
-        result.append(ocr_text(region))
+        try:
+            result.append(ocr_text(region))
+        except ManualRequired as exc:
+            label = '题干' if number == 0 else f'选项 {number}'
+            raise ManualRequired(f'{label}：{exc}') from None
     if PERSONAL.search(' '.join(result)):
         raise ManualRequired('识别到个人经历或自评题，请按实际情况填写。')
     return result[0], result[1:]
@@ -519,7 +523,10 @@ def read_quiz(item, multimedia=False, check=lambda: None, progress=lambda messag
         controls = [control for control in group.locator(TEXT_SELECTOR).all() if control.is_visible()]
         if group.locator('.font-cxsecret').count():
             progress(f'正在读取小测第 {index + 1} / {len(item.root)} 题：本机文字识别')
-        visual = visual_choice_text(group, choices, check)
+        try:
+            visual = visual_choice_text(group, choices, check)
+        except ManualRequired as exc:
+            raise ManualRequired(f'第 {index + 1} 题，{exc}') from None
         if choices and controls:
             raise ManualRequired('同一道题混合了选择与填空控件，尚不能可靠对应，请手动处理。')
         if controls:

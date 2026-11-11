@@ -142,7 +142,7 @@ class UaiGuiTests(unittest.TestCase):
         self.assertEqual(PLATFORMS.get('U校园 AI'), 'uai')
         app.platform.set('U校园 AI')
         self.assertIn('进入具体课件', app.platform_hint.get())
-        for capability in ('文字选择', '填空', '词库', '阅读题'):
+        for capability in ('小测直接截图', '图片模型'):
             self.assertIn(capability, app.platform_hint.get())
         for limitation in ('听力', '口语', '未适配分页', '需手动处理'):
             self.assertIn(limitation, app.platform_hint.get())

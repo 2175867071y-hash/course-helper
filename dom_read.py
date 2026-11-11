@@ -5,11 +5,15 @@ import time
 
 
 def is_loading_error(exc):
-    from playwright.sync_api import Error
+    from playwright.sync_api import Error, TimeoutError
+    # 提交/切节后页面正在跳转时，读取元素会超时；这属于“暂时读不到”，
+    # 应该重试并给可恢复提示，而不是当成致命错误。
+    if isinstance(exc, TimeoutError):
+        return True
     return isinstance(exc, Error) and any(text in str(exc).lower() for text in (
         'execution context was destroyed', 'frame was detached', 'frame has been detached',
         'cannot find context with specified id', 'unable to adopt element handle',
-        'frame does not have execution context'))
+        'frame does not have execution context', 'timeout'))
 
 
 def retry_dom_read(function):

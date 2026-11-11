@@ -14,6 +14,183 @@ from gui import App
 
 
 class GuiTests(unittest.TestCase):
+    def test_task_cannot_erase_api_settings_saved_in_another_window(self):
+        from credentials import protect_api_key
+        self.app = app = App(self.root, Path(self.directory.name))
+        path = Path(self.directory.name) / 'settings.json'
+        config = dict(ai_base_url='https://api.example.test', vision_model='test-vision',
+                      ai_api_key_protected=protect_api_key('test-only-rotated'),
+                      speech_api_key_protected=protect_api_key('test-only-speech'))
+        path.write_text(json.dumps(config), encoding='utf-8')
+        before = path.read_bytes()
+        with patch('gui.messagebox.showerror') as error:
+            app.start('inspect')
+            error.assert_called_once()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(app.jobs)
+        dialog = app.show_settings()
+        with patch('gui.messagebox.showerror') as error:
+            dialog.save()
+            error.assert_called_once()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_bad_settings_file_survives_task_start(self):
+        path = Path(self.directory.name) / 'settings.json'
+        path.write_bytes(b'{"ai_model":')
+        self.app = app = App(self.root, Path(self.directory.name))
+        self.assertIn('配置文件', app.status.get())
+        with patch('gui.messagebox.showerror') as error:
+            app.start('inspect')
+            error.assert_called_once()
+        self.assertEqual(path.read_bytes(), b'{"ai_model":')
+        self.assertFalse(app.jobs)
+
+    def test_bom_settings_restore_key_and_task_preserves_original_ciphertext(self):
+        from credentials import protect_api_key
+        path = Path(self.directory.name) / 'settings.json'
+        protected = protect_api_key('test-only-bom')
+        path.write_text(json.dumps(dict(ai_api_key_protected=protected, ai_model='test')),
+                        encoding='utf-8-sig')
+        self.app = app = App(self.root, Path(self.directory.name), runner=lambda *_: None)
+        self.assertEqual(app.ai_api_key.get(), 'test-only-bom')
+        app.start('run')
+        self.assertEqual(json.loads(path.read_text('utf-8'))['ai_api_key_protected'], protected)
+
+    def test_unreadable_key_survives_editing_unrelated_settings(self):
+        path = Path(self.directory.name) / 'settings.json'
+        broken = 'dpapi:v1:invalid-test'
+        path.write_text(json.dumps(dict(ai_api_key_protected=broken)), encoding='utf-8')
+        self.app = app = App(self.root, Path(self.directory.name))
+        dialog = app.show_settings()
+        dialog.document_seconds.set('20')
+        dialog.save()
+        self.assertEqual(json.loads(path.read_text('utf-8')).get('ai_api_key_protected'), broken)
+
+    def test_open_ai_result_window_updates_only_its_own_course(self):
+        from gui import CourseJob
+        from gui_backend import GuiRequest
+        self.app = app = App(self.root, Path(self.directory.name))
+        for name in ('one', 'two'):
+            job = CourseJob(GuiRequest('run', 'generic', name))
+            app.jobs[name] = job
+            app.task_table.insert('', 'end', iid=name)
+        app.select_job('one')
+        app.handle_event(dict(kind='quiz_report', message='豆包网页：正在请求'), app.jobs['one'])
+        window = app.show_ai_results()
+        def texts(widget):
+            return [widget] if isinstance(widget, tk.Text) else [t for child in widget.winfo_children() for t in texts(child)]
+        view = texts(window)[0]
+        app.select_job('two')
+        app.handle_event(dict(kind='quiz_report', message='另一门课'), app.jobs['two'])
+        app.handle_event(dict(kind='quiz_report', message='豆包网页：上传超时'), app.jobs['one'])
+        self.assertIn('上传超时', view.get('1.0', 'end'))
+        self.assertNotIn('另一门课', view.get('1.0', 'end'))
+        window.destroy()
+        app.handle_event(dict(kind='quiz_report', message='已收到'), app.jobs['one'])
+
+    def test_paused_report_and_actions_fit_minimum_window_with_large_fonts(self):
+        from gui import CourseJob
+        from gui_backend import GuiRequest
+        self.root.tk.call('tk', 'scaling', 2.0)
+        self.app = app = App(self.root, Path(self.directory.name))
+        job = CourseJob(GuiRequest('run', 'generic', 'layout-check'))
+        app.jobs['layout-check'] = job
+        app.task_table.insert('', 'end', iid='layout-check')
+        app.select_job('layout-check')
+        app.handle_event(dict(kind='quiz_report', message='第 1 题\n原 AI：B\n豆包：A'), job)
+        app.handle_event(dict(kind='prompt', request_id=1, title='需要处理',
+            message='两边答案不同，已暂停。', context='quiz', choices=[('r', '继续'), ('s', '停止')]), job)
+        self.root.deiconify()
+        self.root.update()
+        for widget in [app.prompt_report] + app.prompt_actions.winfo_children():
+            self.assertTrue(widget.winfo_ismapped())
+            self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                self.root.winfo_rooty() + self.root.winfo_height())
+        self.assertGreater(app.prompt_report.winfo_height(), 40)
+
+    def test_paused_report_is_visible_and_isolated_per_course(self):
+        from gui import CourseJob
+        from gui_backend import GuiRequest
+        self.app = app = App(self.root, Path(self.directory.name))
+        for name in ('one', 'two'):
+            job = CourseJob(GuiRequest('run', 'generic', name))
+            app.jobs[name] = job
+            app.task_table.insert('', 'end', iid=name)
+        app.select_job('one')
+        app.handle_event({'kind': 'quiz_report', 'message': '第 1 题\n原 AI：B\n豆包：A'}, app.jobs['one'])
+        prompt = dict(kind='prompt', request_id=1, title='需要处理', message='答案分歧',
+                      context='quiz', choices=[('r', '继续')])
+        app.handle_event(prompt, app.jobs['one'])
+        self.assertIn('原 AI：B', app.prompt_report.get('1.0', 'end'))
+        self.assertIn('豆包：A', app.prompt_report.get('1.0', 'end'))
+        app.select_job('two')
+        app.handle_event(prompt, app.jobs['two'])
+        self.assertEqual(app.prompt_report.get('1.0', 'end').strip(), '')
+        app.select_job('one')
+        self.assertIn('豆包：A', app.prompt_report.get('1.0', 'end'))
+
+    def test_video_and_other_pauses_hide_quiz_report_but_keep_result_history(self):
+        from gui import CourseJob
+        from gui_backend import GuiRequest
+        self.app = app = App(self.root, Path(self.directory.name))
+        job = CourseJob(GuiRequest('run', 'generic', 'course'))
+        app.jobs['course'] = job
+        app.task_table.insert('', 'end', iid='course')
+        app.select_job('course')
+        app.handle_event(dict(kind='quiz_report', message='本组尚未收到 AI 答案。'), job)
+        app.handle_event(dict(kind='prompt', request_id=1, title='需要处理',
+                             message='小测请求失败', context='quiz', choices=[('r', '继续')]), job)
+        self.assertEqual(app.prompt_report.frame.winfo_manager(), 'pack')
+        for message in ('已尝试启动本视频，请亲自点击播放后选择继续。',
+                        '请登录课程', '未找到下一节目录'):
+            with self.subTest(message=message):
+                app.handle_event(dict(kind='prompt', request_id=2, title='需要处理',
+                                     message=message, choices=[('r', '继续')]), job)
+                self.assertEqual(app.prompt_report.frame.winfo_manager(), '')
+                self.assertEqual(app.prompt_report.get('1.0', 'end').strip(), '')
+                self.assertEqual(app.prompt_message.cget('text'), message)
+                # 延后到达的报告及重新选中课程也不能把答案放入非答题提示。
+                app.handle_event(dict(kind='quiz_report', message='原 AI：B\n豆包：A'), job)
+                app.select_job('course')
+                self.assertEqual(app.prompt_report.frame.winfo_manager(), '')
+                self.assertEqual(job.quiz_report, '原 AI：B\n豆包：A')
+
+    def test_doubao_review_setting_persists_and_reaches_new_task(self):
+        self.app = app = App(self.root, Path(self.directory.name))
+        self.assertEqual(app.quiz_review_provider.get(), '豆包网页')
+        dialog = app.show_settings()
+        dialog.quiz_review_provider.set('原 API 多轮')
+        dialog.save()
+        app.quiz_review_provider.set('豆包网页')
+        app._load_settings()
+        self.assertEqual(app.quiz_review_provider.get(), '原 API 多轮')
+        received = []
+        app.runner = lambda request, bridge, directory: received.append(request)
+        app.start('run')
+        self.pump_until(lambda: bool(received))
+        self.assertEqual(received[0].quiz_review_provider, '原 API 多轮')
+
+    def test_cross_check_settings_persist_and_reach_new_task(self):
+        self.app = app = App(self.root, Path(self.directory.name))
+        self.assertTrue(hasattr(app, 'quiz_cross_check'), '缺少交叉复核开关')
+        self.assertTrue(app.quiz_cross_check.get())
+        dialog = app.show_settings()
+        dialog.quiz_cross_check.set(False)
+        dialog.ai_review_model.set('other-vision')
+        dialog.save()
+        app.quiz_cross_check.set(True)
+        app.ai_review_model.set('')
+        app._load_settings()
+        self.assertFalse(app.quiz_cross_check.get())
+        self.assertEqual(app.ai_review_model.get(), 'other-vision')
+        received = []
+        app.runner = lambda request, bridge, directory: received.append(request)
+        app.start('run')
+        self.pump_until(lambda: bool(received))
+        self.assertFalse(received[0].quiz_cross_check)
+        self.assertEqual(received[0].ai_review_model, 'other-vision')
+
     def test_background_playback_is_saved_and_used_for_new_task(self):
         from gui_backend import GuiRequest
         self.app = app = App(self.root, Path(self.directory.name))
@@ -502,6 +679,22 @@ class GuiTests(unittest.TestCase):
                 self.assertTrue(error.called)
         self.assertEqual(app.ai_base_url.get(), '')
         self.assertFalse((Path(self.directory.name) / 'settings.json').exists())
+
+    def test_settings_reject_deepseek_website_without_overwriting_configuration(self):
+        self.app = app = App(self.root, Path(self.directory.name))
+        app.ai_base_url.set('https://api.deepseek.com')
+        app._save_settings()
+        path = Path(self.directory.name) / 'settings.json'
+        before = path.read_bytes()
+        dialog = app.show_settings()
+        dialog.ai_base_url.set('https://deepseek.com/')
+        with patch('gui.messagebox.showerror') as error:
+            dialog.save()
+        self.assertTrue(error.called)
+        self.assertIn('https://api.deepseek.com', error.call_args.args[1])
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(app.ai_base_url.get(), 'https://api.deepseek.com')
+        self.assertEqual(path.read_bytes(), before)
 
     def test_requests_include_auto_settings_and_missing_ai_does_not_block_video(self):
         requests = []

@@ -4,6 +4,8 @@ import importlib
 import io
 import json
 from pathlib import Path
+import socket
+import ssl
 import sys
 import traceback
 import unittest
@@ -109,10 +111,53 @@ class QuizAITests(unittest.TestCase):
         self.assertEqual(opener.request.full_url,
                          "https://ai.example/v1/chat/completions")
 
+    def test_image_request_allows_slow_vision_reply(self):
+        self.question.images = [quiz_ai.QuizImage('q1_image', b'\x89PNG\r\n\x1a\nTEST')]
+        result, opener = self.solve(vision_model='vision')
+        self.assertEqual(opener.timeout, 120)
+        self.assertEqual(result[0].selected, [1])
+
+    def test_network_errors_identify_cause_without_transport_details(self):
+        self.question.images = [quiz_ai.QuizImage('q1_image', b'\x89PNG\r\n\x1a\nTEST')]
+        for error, expected in (
+            (TimeoutError(self.secret), '120 秒'),
+            (URLError(TimeoutError(self.secret)), '120 秒'),
+            (URLError(socket.gaierror(self.secret)), '域名解析'),
+            (URLError(ssl.SSLCertVerificationError(self.secret)), '证书'),
+            (ConnectionResetError(self.secret), '连接中断'),
+        ):
+            with self.subTest(expected=expected), self.assertRaises(quiz_ai.QuizAIError) as caught:
+                self.solve(FakeOpener(error=error), vision_model='vision')
+            self.assertIn(expected, str(caught.exception))
+            self.assertNotIn(self.secret, ''.join(traceback.format_exception(caught.exception)))
+
+    def test_timeout_during_response_read_identifies_stage(self):
+        response = self.response()
+        with patch.object(response, 'read', side_effect=TimeoutError(self.secret)):
+            with self.assertRaisesRegex(quiz_ai.QuizAIError, '读取回答.*30 秒'):
+                self.solve(FakeOpener(response))
+
     def test_base_url_trailing_slash_is_supported(self):
         _, opener = self.solve(base_url="https://ai.example/v1/")
         self.assertEqual(opener.request.full_url,
                          "https://ai.example/v1/chat/completions")
+
+    def test_deepseek_websites_are_rejected_before_sending_key(self):
+        for host in ('deepseek.com', 'www.deepseek.com', 'chat.deepseek.com',
+                     'platform.deepseek.com'):
+            opener = FakeOpener(self.response())
+            with self.subTest(host=host):
+                with self.assertRaises(quiz_ai.QuizAIError) as caught:
+                    self.solve(opener, base_url='https://' + host + '/')
+                self.assertIn('https://api.deepseek.com', str(caught.exception))
+                self.assertIsNone(opener.request)
+
+    def test_deepseek_api_base_and_full_endpoint_remain_supported(self):
+        for base in ('https://api.deepseek.com', 'https://api.deepseek.com/v1/',
+                     'https://api.deepseek.com/chat/completions'):
+            with self.subTest(base=base):
+                answers, _ = self.solve(base_url=base)
+                self.assertEqual(answers[0].selected, [1])
 
     def test_redirect_handler_does_not_forward_the_bearer_key(self):
         opener = FakeOpener(self.response())
@@ -263,6 +308,42 @@ class QuizAITests(unittest.TestCase):
             with self.subTest(status=status), self.assertRaises(quiz_ai.QuizAIError):
                 self.solve(FakeOpener(response))
             self.assertEqual(response.read_sizes, [])
+
+    def test_http_failures_report_status_and_action_without_echoing_response(self):
+        cases = ((302, '重定向'), (307, '重定向'), (400, '参数'), (401, '密钥'),
+                 (402, '余额'), (403, '权限'), (404, '地址'), (413, '过大'),
+                 (422, '参数'), (429, '频率'), (500, '服务端'), (503, '服务端'),
+                 (418, '服务商'))
+        marker = self.secret + ' PRIVATE-ERROR-BODY'
+        for status, action in cases:
+            for via_exception in (False, True):
+                body = io.BytesIO(marker.encode())
+                error = HTTPError('https://ai.example/' + marker, status, marker,
+                                  {'Location': 'https://other.example/' + marker}, body)
+                opener = (FakeOpener(error=error) if via_exception else
+                          FakeOpener(self.response(status=status)))
+                with self.subTest(status=status, via_exception=via_exception):
+                    with self.assertRaises(quiz_ai.QuizAIError) as caught:
+                        self.solve(opener)
+                    message = str(caught.exception)
+                    self.assertIn('HTTP ' + str(status), message)
+                    self.assertIn(action, message)
+                    if status >= 400:
+                        self.assertNotIn('重定向', message)
+                    display = ''.join(traceback.format_exception(caught.exception))
+                    self.assertNotIn(marker, display)
+                    if via_exception:
+                        self.assertTrue(body.closed)
+                    else:
+                        body.close()
+
+    def test_invalid_http_status_is_not_echoed(self):
+        for status in (None, True, 9999, self.secret):
+            with self.subTest(status_type=type(status).__name__):
+                with self.assertRaises(quiz_ai.QuizAIError) as caught:
+                    self.solve(FakeOpener(self.response(status=status)))
+                self.assertNotIn(self.secret, str(caught.exception))
+                self.assertIn('状态码', str(caught.exception))
 
     def test_network_and_response_errors_do_not_leak_secret_or_raw_body(self):
         marker = self.secret + " RAW-RESPONSE-PRIVATE"

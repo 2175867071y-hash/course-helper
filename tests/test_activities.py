@@ -88,6 +88,57 @@ class ActivityTests(unittest.TestCase):
             fill.assert_called_once()
             submit.assert_called_once()
 
+    def test_quiz_request_status_counts_shared_material_once_and_stops_on_failure(self):
+        from activities import Activity
+        from quiz_ai import QuizAIError, QuizImage, QuizQuestion
+        course, _ = self.make(ai_base_url='https://ai.example', ai_model='text',
+                              vision_model='vision', ai_api_key='secret')
+        shared = [QuizImage('material1', b'x'), QuizImage('material2', b'y')]
+        questions = [QuizQuestion(str(i), 'single', 'See image', ['A', 'B'],
+                                  images=[QuizImage(f'question{i}', b'z'), *shared])
+                     for i in range(4)]
+        with patch.object(course, '_detect', return_value=Activity('quiz', 'q', Mock(), Mock())), \
+             patch.object(course, '_read_quiz', return_value=(questions, [])), \
+             patch.object(course, '_emit') as emit, \
+             patch('activities.solve_questions', side_effect=QuizAIError('测试超时')) as solve, \
+             patch.object(course, '_fill_answers') as fill, patch.object(course, '_submit_quiz') as submit:
+            with self.assertRaisesRegex(ManualRequired, '测试超时'):
+                course.process()
+            self.assertIn('图片 6', emit.call_args.args[0])
+            solve.assert_called_once()
+            fill.assert_not_called()
+            submit.assert_not_called()
+
+    def test_primary_failure_collects_web_answer_without_filling_or_submitting(self):
+        from activities import Activity
+        from quiz_ai import QuizImage, QuizQuestion
+        from tests.test_quiz_crosscheck import RoundAI, choice
+        web_result = {'answers': [choice('0', 'B')]}
+        reviewer = Mock(spec=['with_updates'])
+        def review_with_updates(data, images, update):
+            update({'status': '正在接收豆包回答'})
+            update({'status': '已收到回答', 'result': web_result})
+            return web_result
+        reviewer.with_updates.side_effect = review_with_updates
+        course, _ = self.make(ai_base_url='https://ai.example/v1', ai_model='text',
+            vision_model='vision', ai_api_key='TEST-KEY', quiz_cross_check=True, web_review=reviewer)
+        question = QuizQuestion('0', 'single', '按截图作答', ['A', 'B'], page_letters=True,
+            images=[QuizImage('question0', b'\x89PNG\r\n\x1a\nTEST')])
+        reports = []
+        with patch.object(course, '_detect', return_value=Activity('quiz', 'q1', Mock(), Mock())), \
+             patch.object(course, '_read_quiz', return_value=([question], ['binding'])), \
+             patch('urllib.request.build_opener', return_value=RoundAI([[choice('0', 'AB')]])), \
+             patch.object(course, '_report', side_effect=reports.append), \
+             patch.object(course, '_fill_answers') as fill, patch.object(course, '_submit_quiz') as submit:
+            with self.assertRaisesRegex(ManualRequired, '未填写或提交'):
+                course.process()
+        reviewer.with_updates.assert_called_once()
+        self.assertTrue(any('正在接收豆包回答' in report for report in reports))
+        self.assertIn('豆包网页：B', reports[-1])
+        fill.assert_not_called()
+        submit.assert_not_called()
+        self.assertEqual(course.submitted, {})
+
     def test_quiz_submit_timeout_is_not_retried(self):
         from activities import Activity
         from quiz_ai import QuizQuestion, QuizAnswer
@@ -139,7 +190,10 @@ class ActivityTests(unittest.TestCase):
     def test_pending_submission_survives_question_disappearing(self):
         from activities import Activity
         course, _ = self.make()
-        item = Activity('quiz', 'quiz1', Mock(), Mock())
+        # 真实 Frame 的 parent_frame 链最终为 None；替身必须显式终止，否则向上遍历不会结束。
+        frame = Mock()
+        frame.parent_frame = None
+        item = Activity('quiz', 'quiz1', frame, Mock())
         course.pending_quiz = item
         course.submitted[item.key] = 0
         with patch.object(course, '_detect', return_value=None), \

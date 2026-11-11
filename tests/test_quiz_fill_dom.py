@@ -40,7 +40,7 @@ class FillDOMTests(unittest.TestCase):
             </form><output id="count">0</output><output id="result"></output></main>''')
 
     def solve(self, values, callback=None):
-        def answer(questions, *_):
+        def answer(questions, *_, report=None):
             self.seen.append(questions)
             if callback:
                 callback()

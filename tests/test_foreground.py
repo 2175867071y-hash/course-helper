@@ -72,6 +72,48 @@ class ForegroundTests(unittest.TestCase):
     def recover(self):
         return self.adapter.recover_foreground_pause(self.key, 1, self.control)
 
+    def test_rate_rejected_only_when_reset_from_selection(self):
+        self.adapter.playback_rate = 2
+        self.assertFalse(self.adapter.rate_rejected(self.key))
+        self.adapter.rate_reports[self.key] = 2.0
+        self.assertFalse(self.adapter.rate_rejected(self.key))
+        self.adapter.rate_reports[self.key] = 1.0
+        self.assertTrue(self.adapter.rate_rejected(self.key))
+
+    def test_rate_rejection_recovers_playback_without_focus_check(self):
+        # 播放器拒绝倍速（重置为实际值）导致暂停时，直接恢复播放，不等待焦点。
+        self.adapter.playback_rate = 2
+        self.adapter.rate_reports[self.key] = 1.0
+        self.media['paused'] = True
+        recovered = self.adapter.recover_rate_rejection(self.key, 1, self.control)
+        self.assertTrue(recovered)
+        self.assertEqual(self.page.frames[0].button.clicks, 1)
+
+    def test_rate_rejection_auto_recovers_without_manual(self):
+        # 播放器拒绝倍速导致的暂停应自动恢复，而不是弹人工提示。
+        states = iter([VideoState('v', 0, 2, False, False),
+                       VideoState('v', 1, 2, False, False),
+                       VideoState('v', 1, 2, True, False),
+                       VideoState('v', 1, 2, True, False),
+                       VideoState('v', 2, 2, True, True)])
+        self.adapter.videos = lambda: [SimpleNamespace(state=next(states))]
+        self.adapter.apply_playback_rate = lambda video: video
+        self.adapter.play = Mock()
+        self.adapter.pause = Mock()
+        self.adapter.guard = lambda: None
+        self.adapter.playback_rate = 2
+        self.adapter.rate_reports['v'] = 1.0
+        clock = itertools.count(step=2)
+        store = Store(':memory:')
+        self.addCleanup(store.close)
+        with patch('main.time.monotonic', side_effect=lambda: next(clock)), \
+             patch('main.ask_manual', return_value='q') as manual:
+            outcome = run_task(self.adapter, Task('rate', 'chaoxing', self.page.url, 1),
+                               store, 1, 90, self.control)
+        self.assertEqual(outcome, 'limit', '倍速拒绝导致的暂停不应转人工')
+        manual.assert_not_called()
+        self.adapter.play.assert_called_once()
+
     def test_player_that_resumes_itself_keeps_consistent_progress_clock(self):
         states = iter([VideoState('v', 0, 7, False, False),
                        VideoState('v', 2, 7, False, False),

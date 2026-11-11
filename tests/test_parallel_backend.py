@@ -1,4 +1,4 @@
-"""多任务后台的线程、浏览器配置及日志隔离，不访问真实网站。"""
+﻿"""多任务后台的线程、浏览器配置及日志隔离，不访问真实网站。"""
 from contextlib import contextmanager
 import logging
 from pathlib import Path
@@ -45,7 +45,7 @@ def fake_browser(launches, closed, run):
             return False
 
     with patch.dict('sys.modules', {
-        'playwright.sync_api': SimpleNamespace(sync_playwright=Driver),
+        'playwright.sync_api': SimpleNamespace(sync_playwright=Driver, TimeoutError=TimeoutError),
         'activities': SimpleNamespace(CourseActivities=lambda *args, **kwargs: object()),
     }), patch('gui_backend.Adapter', side_effect=lambda page, *args, **kwargs:
               SimpleNamespace(page=page, inspect=lambda: {'url': page.url},

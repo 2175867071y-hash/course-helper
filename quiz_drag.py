@@ -38,7 +38,7 @@ def _stable_key(node):
     return key
 
 
-def read_drag(group, index, context, mapping):
+def read_drag(group, index, context, mapping, visual=False):
     from quiz_media import references
     candidates = group.locator(SOURCES).all()
     if any(not source.is_visible() for source in candidates):
@@ -51,7 +51,7 @@ def read_drag(group, index, context, mapping):
     sources, source_bindings = [], {}
     for number, (_, node) in enumerate(keyed):
         identity = f'q{index}_s{number}'
-        text = node.inner_text().strip() or node.get_attribute('aria-label') or ''
+        text = ('来源 ' + identity if visual else node.inner_text().strip() or node.get_attribute('aria-label') or '')
         refs = references(node, mapping)
         if refs:
             text += ' [图片：' + ', '.join(refs) + ']'
@@ -74,7 +74,7 @@ def read_drag(group, index, context, mapping):
             if not node.is_visible() or not node.is_enabled():
                 raise ManualRequired('拖拽落点尚未显示或不可操作。')
             identity = f'q{index}_t{number}'
-            label = node.get_attribute('aria-label') or node.get_attribute('data-label')
+            label = ('落点 ' + identity if visual else node.get_attribute('aria-label') or node.get_attribute('data-label'))
             if not label:
                 label = node.evaluate("""(e,s)=>{const c=e.cloneNode(true);
                     c.querySelectorAll(s).forEach(n=>n.remove());return (c.textContent||'').trim();}""", SOURCES)
@@ -87,7 +87,7 @@ def read_drag(group, index, context, mapping):
             target_bindings[identity] = node.element_handle()
     if not 1 <= len(targets) <= len(sources) <= 100:
         raise ManualRequired('拖拽来源与落点数量不匹配，当前支持每个落点放一个不同选项。')
-    prompt = drag_prompt(group) or ('按题意排序。' if kind == 'sort' else '将选项匹配到对应落点。')
+    prompt = ('' if visual else drag_prompt(group)) or ('按题意排序。' if kind == 'sort' else '将选项匹配到对应落点。')
     return QuizQuestion(str(index), kind, prompt, [], context=context,
         drag_sources=sources, drag_targets=targets), DragBinding(source_bindings, target_bindings, kind, container)
 

@@ -1,4 +1,4 @@
-"""双击入口；所有窗口操作均在 Tk 主线程执行。"""
+﻿"""双击入口；所有窗口操作均在 Tk 主线程执行。"""
 import json
 from collections import deque
 from dataclasses import dataclass, field
@@ -13,15 +13,19 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 from urllib.parse import urlsplit
 
-from core import Store, validate_url
+from core import Store, validate_url, validate_playback_rate
 from credentials import protect_api_key, unprotect_api_key
-from gui_backend import Bridge, GuiRequest, execute
+from gui_backend import Bridge, GuiRequest, execute, task_directory
 
 PLATFORMS = {'通用课程（自动识别链接）': 'generic', '超星学习通': 'chaoxing',
              '中国大学 MOOC': 'mooc', 'U校园 AI': 'uai'}
 BROWSERS = {'Microsoft Edge': 'msedge', 'Google Chrome': 'chrome'}
+API_FIELDS = ('ai_base_url', 'ai_model', 'vision_model', 'ai_review_model',
+              'speech_base_url', 'speech_model', 'remember_api_key',
+              'ai_api_key_protected', 'speech_api_key_protected')
 OUTCOMES = {'inspected': '检测完成', 'limit': '已达到本次视频数量，进度已保存',
             's': '本课程已结束，进度已保存', 'q': '已停止，进度保留到最后一次观测',
+            'ai_disagreement': '本课程已终止，双方答案有分歧。点击「AI 结果」查看逐题比较。',
             'cancelled': '已停止', 'error': '需要检查一下'}
 
 
@@ -34,6 +38,7 @@ class CourseJob:
     progress_text: str = '正在准备浏览器，请稍候…'
     progress_value: float = 0
     prompt: object = None
+    quiz_report: str = ''
     pending_done: object = None
     logs: object = field(default_factory=lambda: deque(maxlen=500))
 
@@ -41,6 +46,22 @@ class CourseJob:
 def app_data_dir():
     base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
     return base / 'CourseHelper'
+
+
+def read_settings(path):
+    try:
+        saved = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        raise ValueError('配置文件格式无法读取，已保留原文件。请修复配置后重新打开助手。') from None
+    if not isinstance(saved, dict):
+        raise ValueError('配置文件格式无效，已保留原文件。请修复配置后重新打开助手。')
+    return saved
+
+
+def api_fields(saved):
+    return {name: saved[name] for name in API_FIELDS if name in saved}
 
 
 def clock_text(seconds):
@@ -58,6 +79,10 @@ def automation_values(source):
         raise ValueError('文档每页停留时间须为 3 到 120 秒的整数。') from None
     if not 3 <= seconds <= 120:
         raise ValueError('文档每页停留时间须为 3 到 120 秒的整数。')
+    try:
+        rate = validate_playback_rate(float(source.playback_rate.get()))
+    except (ValueError, TypeError):
+        raise ValueError('视频倍速须为 1 到 4 之间的数字。') from None
     base = source.ai_base_url.get().strip()
     if base:
         try:
@@ -71,6 +96,11 @@ def automation_values(source):
             valid = False
         if not valid:
             raise ValueError('AI base URL 须为 HTTPS 地址，不能包含账号、密码、查询参数或片段。')
+        from quiz_ai import _endpoint, QuizAIError
+        try:
+            _endpoint(base)
+        except QuizAIError as exc:
+            raise ValueError(str(exc)) from None
     speech_base = source.speech_base_url.get().strip()
     if speech_base:
         from quiz_ai import _endpoint, QuizAIError
@@ -81,8 +111,12 @@ def automation_values(source):
     vision = source.vision_model.get().strip()
     if not vision and base and urlsplit(base).hostname == 'api.deepseek.com':
         vision = 'deepseek-flash'
+    if source.quiz_review_provider.get() not in ('豆包网页', '原 API 多轮'):
+        raise ValueError('请选择有效的交叉复核方式。')
     return dict(auto_documents=source.auto_documents.get(), auto_quiz=source.auto_quiz.get(),
-                quiz_submit=source.quiz_submit.get(),
+                quiz_review_provider=source.quiz_review_provider.get(),
+                quiz_submit=source.quiz_submit.get(), playback_rate=rate,
+                quiz_cross_check=source.quiz_cross_check.get(), ai_review_model=source.ai_review_model.get().strip(),
                 document_seconds=seconds, ai_base_url=base,
                 ai_model=source.ai_model.get().strip(), ai_api_key=source.ai_api_key.get().strip(),
                 vision_model=vision, speech_base_url=speech_base,
@@ -100,7 +134,11 @@ class LearningSettingsDialog(tk.Toplevel):
         self.auto_documents = tk.BooleanVar(self, value=app.auto_documents.get())
         self.auto_quiz = tk.BooleanVar(self, value=app.auto_quiz.get())
         self.quiz_submit = tk.BooleanVar(self, value=app.quiz_submit.get())
+        self.quiz_cross_check = tk.BooleanVar(self, value=app.quiz_cross_check.get())
+        self.ai_review_model = tk.StringVar(self, value=app.ai_review_model.get())
+        self.quiz_review_provider = tk.StringVar(self, value=app.quiz_review_provider.get())
         self.document_seconds = tk.StringVar(self, value=app.document_seconds.get())
+        self.playback_rate = tk.StringVar(self, value=app.playback_rate.get())
         self.ai_base_url = tk.StringVar(self, value=app.ai_base_url.get())
         self.ai_model = tk.StringVar(self, value=app.ai_model.get())
         self.ai_api_key = tk.StringVar(self, value=app.ai_api_key.get())
@@ -112,28 +150,52 @@ class LearningSettingsDialog(tk.Toplevel):
         frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(frame, text='自动学习文档并翻页', variable=self.auto_documents).grid(
             row=0, column=0, columnspan=2, sticky='w')
-        ttk.Label(frame, text='每页停留（秒）').grid(row=1, column=0, sticky='w', pady=(10, 16))
-        ttk.Spinbox(frame, from_=3, to=120, textvariable=self.document_seconds, width=10).grid(
-            row=1, column=1, sticky='w', pady=(10, 16))
+        timing = ttk.Frame(frame, style='Card.TFrame')
+        timing.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(10, 16))
+        ttk.Label(timing, text='每页停留（秒）').grid(row=0, column=0, sticky='w')
+        ttk.Spinbox(timing, from_=3, to=120, textvariable=self.document_seconds, width=7).grid(
+            row=0, column=1, sticky='w', padx=(8, 22))
+        ttk.Label(timing, text='视频倍速').grid(row=0, column=2, sticky='w')
+        ttk.Combobox(timing, textvariable=self.playback_rate, state='readonly',
+                     values=('1', '1.25', '1.5', '2', '3', '4'), width=7).grid(
+            row=0, column=3, sticky='w', padx=(8, 0))
+        ttk.Label(timing, text='没有倍速按钮也会尝试设置；实际速度见运行状态，平台计时可能不同。',
+                  style='Hint.TLabel', wraplength=570).grid(
+                      row=1, column=0, columnspan=4, sticky='w', pady=(5, 0))
         ttk.Checkbutton(frame, text='使用 AI 处理课程小测', variable=self.auto_quiz).grid(
             row=2, column=0, columnspan=2, sticky='w', pady=(0, 8))
-        ttk.Checkbutton(frame, text='自动提交小测（关闭后只填写，等待我检查）',
+        ttk.Checkbutton(frame, text='自动提交小测（含交卷确认；关闭后只填写）',
                         variable=self.quiz_submit).grid(
                             row=3, column=0, columnspan=2, sticky='w', pady=(0, 14))
         notebook = ttk.Notebook(frame)
         notebook.grid(row=4, column=0, columnspan=2, sticky='ew')
-        text_page, media_page = [ttk.Frame(notebook, style='Card.TFrame', padding=14) for _ in range(2)]
-        notebook.add(text_page, text='文字与图片')
+        text_page, media_page, review_page = [ttk.Frame(notebook, style='Card.TFrame', padding=14) for _ in range(3)]
+        notebook.add(text_page, text='截图答题')
         notebook.add(media_page, text='听力转写')
-        for page in (text_page, media_page):
+        notebook.add(review_page, text='交叉复核')
+        for page in (text_page, media_page, review_page):
             page.columnconfigure(1, weight=1)
+        ttk.Checkbutton(review_page, text='启用交叉复核',
+                        variable=self.quiz_cross_check).grid(row=0, column=0, columnspan=2, sticky='w', pady=6)
+        ttk.Label(review_page, text='复核方式').grid(row=1, column=0, sticky='w', pady=6)
+        ttk.Combobox(review_page, textvariable=self.quiz_review_provider, state='readonly',
+                     values=('豆包网页', '原 API 多轮')).grid(row=1, column=1, sticky='ew', pady=6)
+        ttk.Label(review_page, text='API 复核图片模型').grid(row=2, column=0, sticky='w', pady=6, padx=(0, 14))
+        ttk.Entry(review_page, textvariable=self.ai_review_model).grid(row=2, column=1, sticky='ew', pady=6)
+        ttk.Label(review_page, text='豆包网页：原 AI 先答，再把原截图发到豆包新对话，全部一致才填写和提交。'
+                  '首次须在专用窗口登录，之后沿用登录状态；多个课程排队复核。无需豆包 API Key。'
+                  '网页必须能够访问，助手不会修改 VPN。', style='Hint.TLabel', wraplength=500).grid(
+                      row=3, column=0, columnspan=2, sticky='w', pady=6)
+        ttk.Label(review_page, text='原 API 多轮：2–3 轮独立作答；上面的模型留空沿用原图片模型。'
+                  '两种模式都会增加等待时间；答案一致仍可能答错。豆包网页接入尚待真实网络验证。',
+                  wraplength=500).grid(row=4, column=0, columnspan=2, sticky='w', pady=6)
         for row, label, variable in ((0, 'AI base URL', self.ai_base_url),
-                                     (1, '文字模型', self.ai_model),
+                                     (1, '旧版文字模型', self.ai_model),
                                      (2, '图片模型', self.vision_model)):
             ttk.Label(text_page, text=label).grid(row=row, column=0, sticky='w', padx=(0, 14), pady=6)
             ttk.Entry(text_page, textvariable=variable).grid(row=row, column=1, sticky='ew', pady=6)
         ttk.Label(text_page, text='DeepSeek 官方地址的图片模型留空时使用 deepseek-flash；'
-                  '其他服务请填写支持图片输入的模型。图片与文字共用该地址和密钥。',
+                  '其他服务请填写支持图片输入的模型。题目直接截图，沿用此处密钥。',
                   style='Hint.TLabel', wraplength=500).grid(row=3, column=0, columnspan=2, sticky='w', pady=6)
         ttk.Label(text_page, text='API Key').grid(row=4, column=0, sticky='w', pady=6)
         self.ai_api_key_entry = ttk.Entry(text_page, textvariable=self.ai_api_key, show='*')
@@ -146,7 +208,7 @@ class LearningSettingsDialog(tk.Toplevel):
         self.speech_api_key_entry = ttk.Entry(media_page, textvariable=self.speech_api_key, show='*')
         self.speech_api_key_entry.grid(row=2, column=1, sticky='ew', pady=6)
         ttk.Label(media_page, text='填写支持 /audio/transcriptions 的服务地址、模型和该服务的密钥。'
-                  '听力先转写成文字，再由文字模型解题。不会把 DeepSeek 密钥自动发给其他服务。'
+                  '听力转写后与题目截图一起交给图片模型。不会把 DeepSeek 密钥自动发给其他服务。'
                   '转写支持可读取的完整音频；分片流、受限音频和语调辨识暂不支持。',
                   style='Hint.TLabel', wraplength=500).grid(row=3, column=0, columnspan=2, sticky='w', pady=6)
         ttk.Checkbutton(frame, text='记住两组 API Key（在本机加密保存）',
@@ -155,8 +217,8 @@ class LearningSettingsDialog(tk.Toplevel):
         ttk.Label(frame, text='下次打开自动读取；取消勾选并保存可清除已保存的密钥。',
                   style='Hint.TLabel', wraplength=420).grid(
                       row=6, column=0, columnspan=2, sticky='w', pady=(4, 12))
-        ttk.Label(frame, text='支持已识别的文字题、图片题、听力转写及拖拽匹配/排序。'
-                  '题目文字与图片发送至 AI 服务，听力音频发送至你配置的转写服务。'
+        ttk.Label(frame, text='题目和材料截图直接发送至图片模型，不调用本机文字识别。'
+                  '支持已适配的选择、填空与拖拽控件；听力音频发送至配置的转写服务。'
                   'AI 可能答错；缺少材料、个人自评或未适配控件会提示你处理。',
                   wraplength=570).grid(
                       row=7, column=0, columnspan=2, sticky='w', pady=(4, 8))
@@ -195,8 +257,12 @@ class LearningSettingsDialog(tk.Toplevel):
             return
         if self.remember_api_key.get() and self.ai_api_key.get().strip():
             self.app.append_log('自动学习设置已保存；API Key 已在本机加密保存，下次打开自动读取。')
+        elif self.app._unreadable_key is not None:
+            self.app.append_log('原有 API Key 暂时无法读取，加密记录已保留。')
         else:
             self.app.append_log('自动学习设置已保存；本机未保存 API Key，当前密钥仅用于本次运行。')
+        self.app.append_log('新设置用于新启动的任务。请停止旧任务并重新添加；'
+                            '仅点“已处理，继续”会沿用旧任务设置。')
         self.destroy()
 
     def destroy(self):
@@ -220,7 +286,7 @@ class App:
         self.prompt_id = None
         self.closing = False
         self.settings_window = None
-        self.root.title('网课助手 · 1.6.4')
+        self.root.title('网课助手 · 1.6.48 豆包复核试用版')
         self.root.geometry('900x820')
         self.root.minsize(820, 780)
         self.root.configure(bg='#F3F5F8')
@@ -239,7 +305,11 @@ class App:
         self.auto_documents = tk.BooleanVar(value=True)
         self.auto_quiz = tk.BooleanVar(value=True)
         self.quiz_submit = tk.BooleanVar(value=True)
+        self.quiz_cross_check = tk.BooleanVar(value=True)
+        self.ai_review_model = tk.StringVar()
+        self.quiz_review_provider = tk.StringVar(value='豆包网页')
         self.document_seconds = tk.StringVar(value='10')
+        self.playback_rate = tk.StringVar(value='2')
         self.ai_base_url = tk.StringVar()
         self.ai_model = tk.StringVar()
         self.ai_api_key = tk.StringVar()
@@ -351,6 +421,9 @@ class App:
         self.stop_all_button.pack(side='right')
         self.stop_button = ttk.Button(task_actions, text='停止所选', command=self.stop, state='disabled')
         self.stop_button.pack(side='right', padx=(0, 8))
+        ttk.Button(task_actions, text='截图说明', command=self.show_screenshot_help).pack(
+            side='right', padx=(0, 8))
+        ttk.Button(task_actions, text='AI 结果', command=self.show_ai_results).pack(side='right', padx=(0, 8))
         task_table = ttk.Frame(task_frame, style='Card.TFrame')
         task_table.pack(fill='x')
         self.task_table = ttk.Treeview(task_table, columns=('platform', 'name', 'status', 'progress'),
@@ -377,6 +450,8 @@ class App:
         self.prompt_title.pack(anchor='w')
         self.prompt_message = ttk.Label(self.prompt_frame, wraplength=740)
         self.prompt_message.pack(anchor='w', pady=(5, 8))
+        self.prompt_report = scrolledtext.ScrolledText(self.prompt_frame, height=3, wrap='word',
+            state='disabled', font=('Microsoft YaHei UI', 9))
         self.prompt_actions = ttk.Frame(self.prompt_frame, style='Card.TFrame')
         self.prompt_actions.pack(fill='x')
         self.prompt_frame.grid_remove()
@@ -396,8 +471,9 @@ class App:
         self.root.geometry(f'{width}x{height}')
 
     def _load_settings(self):
+        self._loaded_api_fields = None
         try:
-            saved = json.loads((self.data_dir / 'settings.json').read_text(encoding='utf-8'))
+            saved = read_settings(self.data_dir / 'settings.json')
             if saved.get('platform') in PLATFORMS:
                 self.platform.set(saved['platform'])
             if saved.get('browser') in BROWSERS:
@@ -408,15 +484,21 @@ class App:
                 self.maximum.set(str(saved['maximum']))
             if type(saved.get('resume')) is bool:
                 self.resume.set(saved['resume'])
-            for key in ('continuous', 'auto_documents', 'auto_quiz', 'quiz_submit', 'background_playback',
+            for key in ('continuous', 'auto_documents', 'auto_quiz', 'quiz_submit', 'quiz_cross_check', 'background_playback',
                         'remember_api_key'):
                 if type(saved.get(key)) is bool:
                     getattr(self, key).set(saved[key])
             if type(saved.get('document_seconds')) is int and 3 <= saved['document_seconds'] <= 120:
                 self.document_seconds.set(str(saved['document_seconds']))
-            for key in ('ai_base_url', 'ai_model', 'vision_model', 'speech_base_url', 'speech_model'):
+            try:
+                self.playback_rate.set(f"{validate_playback_rate(saved.get('playback_rate')):g}")
+            except ValueError:
+                pass
+            for key in ('ai_base_url', 'ai_model', 'vision_model', 'speech_base_url', 'speech_model', 'ai_review_model'):
                 if isinstance(saved.get(key), str):
                     getattr(self, key).set(saved[key])
+            if saved.get('quiz_review_provider') in ('豆包网页', '原 API 多轮'):
+                self.quiz_review_provider.set(saved['quiz_review_provider'])
             protected = saved.get('ai_api_key_protected')
             self._unreadable_key = None
             self._settings_warning = ''
@@ -434,11 +516,30 @@ class App:
                 except (OSError, ValueError):
                     self._unreadable_speech_key = protected_speech
                     self._settings_warning += ' 已保存的语音转写密钥无法读取，请重新填写并保存。'
-        except (OSError, ValueError, AttributeError):
-            pass
+            self._loaded_api_fields = api_fields(saved)
+        except (OSError, ValueError):
+            self._settings_warning = '配置文件未能读取，原文件已保留。请检查配置后重新打开助手。'
 
     def _save_settings(self, *, update_key=False):
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # 原子替换保护单次写入；独立锁保护多个窗口的读取、对照和替换。
+        with (self.data_dir / '.settings.lock').open('a+b') as lock:
+            lock.seek(0)
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise ValueError('另一个窗口正在保存设置，请稍后重试。') from None
+            current = read_settings(self.data_dir / 'settings.json')
+            if self._loaded_api_fields is None or api_fields(current) != self._loaded_api_fields:
+                raise ValueError('配置文件已变化或先前未能读取。请重新打开助手，载入最新设置。')
+            self._write_settings(current, update_key)
+
+    def _write_settings(self, current, update_key):
         # 连续模式不使用视频数；即使旧输入无效也不阻断整门课学习。
         try:
             maximum = int(self.maximum.get())
@@ -452,24 +553,24 @@ class App:
                      background_playback=self.background_playback.get(),
                      auto_documents=self.auto_documents.get(), auto_quiz=self.auto_quiz.get(),
                      quiz_submit=self.quiz_submit.get(),
+                     quiz_cross_check=self.quiz_cross_check.get(),
+                     quiz_review_provider=self.quiz_review_provider.get(),
                      document_seconds=int(self.document_seconds.get()),
+                     playback_rate=validate_playback_rate(float(self.playback_rate.get())),
                      ai_base_url=self.ai_base_url.get().strip(), ai_model=self.ai_model.get().strip(),
                      remember_api_key=self.remember_api_key.get())
-        for name in ('vision_model', 'speech_base_url', 'speech_model'):
+        for name in ('vision_model', 'speech_base_url', 'speech_model', 'ai_review_model'):
             saved[name] = getattr(self, name).get().strip()
-        key = self.ai_api_key.get().strip()
-        if self.remember_api_key.get():
-            if key:
-                saved['ai_api_key_protected'] = protect_api_key(key)
-            elif self._unreadable_key is not None and not update_key:
-                # 启动视频任务也会保存设置；不能因此抹去尚未成功读取的密钥。
-                saved['ai_api_key_protected'] = self._unreadable_key
-        speech_key = self.speech_api_key.get().strip()
-        if self.remember_api_key.get():
-            if speech_key:
-                saved['speech_api_key_protected'] = protect_api_key(speech_key)
-            elif self._unreadable_speech_key is not None and not update_key:
-                saved['speech_api_key_protected'] = self._unreadable_speech_key
+        if update_key and self.remember_api_key.get():
+            for name, unreadable in (('ai_api_key', self._unreadable_key),
+                                     ('speech_api_key', self._unreadable_speech_key)):
+                key = getattr(self, name).get().strip()
+                if key:
+                    saved[name + '_protected'] = protect_api_key(key)
+                elif unreadable is not None:
+                    saved[name + '_protected'] = unreadable
+        elif not update_key:
+            saved.update(api_fields(current))
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.data_dir,
@@ -482,10 +583,12 @@ class App:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        if update_key or key or not self.remember_api_key.get():
-            self._unreadable_key = None
-        if update_key or speech_key or not self.remember_api_key.get():
-            self._unreadable_speech_key = None
+        self._loaded_api_fields = api_fields(saved)
+        if update_key:
+            if self.ai_api_key.get().strip() or not self.remember_api_key.get():
+                self._unreadable_key = None
+            if self.speech_api_key.get().strip() or not self.remember_api_key.get():
+                self._unreadable_speech_key = None
         if self._unreadable_key is None and self._unreadable_speech_key is None:
             if self._settings_warning and self.status.get() == self._settings_warning:
                 self.status.set('自动学习设置已保存')
@@ -496,10 +599,10 @@ class App:
             self.platform_hint.set('粘贴 HTTPS 课程链接；已知平台自动适配，其他站点尝试通用识别。'
                                    '目录不识别时可在浏览器中定位当前项和下一项。')
         elif PLATFORMS.get(self.platform.get()) == 'uai':
-            self.platform_hint.set('U校园 AI：进入具体课件后再继续；支持已识别的同页文字选择、填空、词库和阅读题。'
-                                   '图片和听力需配置对应模型；口语、自评及未适配分页/控件需手动处理。')
+            self.platform_hint.set('U校园 AI：进入具体课件后再继续；小测直接截图交给图片模型。'
+                                   '听力另需转写服务；口语、自评及未适配分页/控件需手动处理。')
         else:
-            self.platform_hint.set('请在浏览器中打开具体课程章节，再点击“我已打开课程”。')
+            self.platform_hint.set('粘贴章节链接即可自动识别视频、小测或阅读内容。若打开登录页或课程目录，请先进入章节。')
 
     def _on_root_destroy(self, event):
         if event.widget is self.root and self._platform_trace is not None:
@@ -656,9 +759,14 @@ class App:
 
     def clear_prompt(self):
         self.prompt_id = None
+        self.task_table.configure(height=4)
         for widget in self.prompt_actions.winfo_children():
             widget.destroy()
         self.prompt_frame.grid_remove()
+        self.prompt_report.configure(state='normal')
+        self.prompt_report.delete('1.0', 'end')
+        self.prompt_report.configure(state='disabled')
+        self.prompt_report.pack_forget()
 
     def show_prompt(self, event):
         self.clear_prompt()
@@ -666,6 +774,13 @@ class App:
         task_id, request_id = self.selected_id, self.prompt_id
         self.prompt_title.configure(text=event['title'])
         self.prompt_message.configure(text=event['message'])
+        if event.get('context') == 'quiz' and self.selected_job.quiz_report:
+            # 暂停时为答案和操作按钮留出空间，课程仍可通过列表滚动切换。
+            self.task_table.configure(height=2)
+            self.prompt_report.configure(state='normal')
+            self.prompt_report.insert('1.0', self.selected_job.quiz_report)
+            self.prompt_report.configure(state='disabled')
+            self.prompt_report.pack(fill='x', pady=(0, 8), before=self.prompt_actions)
         choices = event['choices']
         if len(choices) > 3:
             selected = ttk.Combobox(self.prompt_actions, state='readonly', width=62,
@@ -702,6 +817,18 @@ class App:
         kind = event['kind']
         if kind == 'log':
             self.append_log(event['message'], job)
+        elif kind == 'quiz_report':
+            job.quiz_report = event['message']
+            for owner, view in getattr(self, '_ai_result_views', []):
+                if owner is job and view.winfo_exists():
+                    position = view.yview()[0]
+                    view.configure(state='normal')
+                    view.delete('1.0', 'end')
+                    view.insert('1.0', job.quiz_report)
+                    view.configure(state='disabled')
+                    view.yview_moveto(position)
+            if job is self.selected_job and job.prompt and job.prompt.get('context') == 'quiz':
+                self.show_prompt(job.prompt)
         elif kind == 'status':
             if not job.bridge.stopped:
                 job.status = event['message']
@@ -775,6 +902,51 @@ class App:
             return
         self.root.after(100, self.poll)
 
+    def show_ai_results(self):
+        job = self.selected_job
+        window = tk.Toplevel(self.root)
+        window.title('本组 AI 返回结果' + (f' · {job.request.task_id}' if job else ''))
+        window.geometry('760x480')
+        content = scrolledtext.ScrolledText(window, wrap='word', font=('Microsoft YaHei UI', 10), padx=12, pady=12)
+        content.pack(fill='both', expand=True)
+        content.insert('1.0', job.quiz_report if job and job.quiz_report else '本课程尚未收到 AI 答案。')
+        content.configure(state='disabled')
+        if not hasattr(self, '_ai_result_views'):
+            self._ai_result_views = []
+        entry = (job, content)
+        self._ai_result_views.append(entry)
+        def closed(event):
+            if event.widget is window and entry in self._ai_result_views:
+                self._ai_result_views.remove(entry)
+        window.bind('<Destroy>', closed, add='+')
+        ttk.Button(window, text='关闭', command=window.destroy).pack(pady=8)
+        return window
+
+    def show_screenshot_help(self):
+        messagebox.showinfo('截图答题', '每题单独截图，跨屏长题拼成整图。每批最多发 5 题，并附上共用材料。\n'
+            '超星选择题可直接按网页字母作答。其他控件用截图标记定位。\n'
+            '开启自动提交后会处理已识别的交卷确认，提交成功后继续下一节。\n'
+            '不使用本机 OCR，也不提取题干或选项文字。\n\n'
+            '请在“自动学习设置 → 截图答题”配置支持图片的模型。\n'
+            '截图不完整、控件无法对应或 AI 无法确定时会暂停提示。', parent=self.root)
+
+    def show_ocr_diagnostics(self):
+        job = self.selected_job
+        if job is None:
+            messagebox.showinfo('识别诊断', '请先在课程任务列表中选择一门课程。', parent=self.root)
+            return
+        directory = task_directory(self.data_dir, job.request) / 'ocr-diagnostics'
+        if not (directory / 'ocr-failure.zip').is_file():
+            messagebox.showinfo('识别诊断', '本课程尚未生成诊断包。\n'
+                                '本版遇到 OCR 识别失败时，会自动保存当时的文字区域图片和识别结果。',
+                                parent=self.root)
+            return
+        try:
+            os.startfile(str(directory))
+        except OSError:
+            messagebox.showerror('识别诊断', f'无法打开目录，请在文件资源管理器中查看：\n{directory}',
+                                 parent=self.root)
+
     def show_records(self):
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -833,12 +1005,26 @@ def main():
             app.ai_api_key.set('self-test-synthetic-api-key')
             app.speech_api_key.set('self-test-synthetic-speech-key')
             app.background_playback.set(False)
+            app.playback_rate.set('1.5')
+            assert app.quiz_cross_check.get() is True
+            app.quiz_cross_check.set(False)
+            app.ai_review_model.set('self-test-review-vision')
+            assert app.quiz_review_provider.get() == '豆包网页'
+            app.quiz_review_provider.set('原 API 多轮')
             app._save_settings(update_key=True)
             app.ai_api_key.set('')
             app.speech_api_key.set('')
             app.background_playback.set(True)
+            app.playback_rate.set('4')
+            app.quiz_cross_check.set(True)
+            app.ai_review_model.set('')
+            app.quiz_review_provider.set('豆包网页')
             app._load_settings()
             assert app.background_playback.get() is False
+            assert float(app.playback_rate.get()) == 1.5
+            assert app.quiz_cross_check.get() is False
+            assert app.ai_review_model.get() == 'self-test-review-vision'
+            assert app.quiz_review_provider.get() == '原 API 多轮'
             assert app.ai_api_key.get() == 'self-test-synthetic-api-key'
             assert app.speech_api_key.get() == 'self-test-synthetic-speech-key'
             assert 'self-test-synthetic-api-key' not in (Path(directory) / 'settings.json').read_text(
@@ -846,29 +1032,69 @@ def main():
             assert 'self-test-synthetic-speech-key' not in (Path(directory) / 'settings.json').read_text(
                 encoding='utf-8')
             import quiz_media, quiz_drag, quiz_speech
-            from quiz_ocr import read_text
+            import doubao_web
+            assert doubao_web.parse_reply('{"request_id":"test","answers":[]}', 'test') == {'answers': []}
+            demo = CourseJob(GuiRequest('run', 'generic', 'self-test'))
+            app.jobs[demo.request.task_id] = demo
+            app.task_table.insert('', 'end', iid=demo.request.task_id)
+            app.select_job(demo.request.task_id)
+            app.handle_event(dict(kind='quiz_report', message='原 AI：B\n豆包：A'), demo)
+            app.handle_event(dict(kind='prompt', request_id=1, title='分歧', message='未提交',
+                                  context='quiz', choices=[('ready', '继续')]), demo)
+            assert '豆包：A' in app.prompt_report.get('1.0', 'end')
+            app.handle_event(dict(kind='prompt', request_id=2, title='播放提示',
+                                  message='请点击视频播放', choices=[('ready', '继续')]), demo)
+            assert not app.prompt_report.frame.winfo_manager()
+            assert not app.prompt_report.get('1.0', 'end').strip()
+            assert '豆包：A' in demo.quiz_report
+            from types import SimpleNamespace
+            from quiz_screenshots import discover_groups, read_screenshots
+            import quiz_dom
             from playwright.sync_api import sync_playwright
+            def forbidden(*args, **kwargs):
+                raise AssertionError('Screenshot mode must not call OCR/text extraction')
+            quiz_dom.ocr_text = forbidden
+            quiz_dom.prompt_text = forbidden
+            quiz_dom.option_text = forbidden
             with sync_playwright() as playwright:
-                assert playwright.chromium.name == 'chromium'
                 browser = playwright.chromium.launch(channel='msedge', headless=True)
-                page = browser.new_page()
-                page.set_content('<p style="font:28px Microsoft YaHei;width:600px">语音识别（ASR）</p>')
-                recognized = read_text(page.locator('p'))
-                assert '语音识别' in recognized and 'ASR' in recognized
-                page.set_content('<span style="font:16px Microsoft YaHei">错</span>')
-                assert read_text(page.locator('span')) == '错'
+                page = browser.new_page(viewport={'width':1100,'height':760})
+                page.set_content('<iframe style="width:1000px;height:600px"></iframe>')
+                frame = page.frames[1]
+                frame.set_content('<main style="height:340px;overflow:auto"><form>'
+                    '<fieldset style="height:900px"><legend>Screenshot test</legend>'
+                    '<label><input type=radio name=q>Top</label><div style="height:650px"></div>'
+                    '<label style="background:blue"><input type=radio name=q>Bottom</label>'
+                    '</fieldset><button>Submit</button></form></main>')
+                item = SimpleNamespace(root=discover_groups(frame), frame=frame)
+                questions, bindings = read_screenshots(item)
+                assert len(questions)==1 and len(bindings[0])==2
+                assert questions[0].images[0].data.startswith(b'\x89PNG\r\n\x1a\n')
+                assert len(questions[0].images[0].data)>1000
+                bindings[0][1][1].click()
+                assert frame.locator('input').nth(1).is_checked()
+                assert frame.locator('[data-ch-capture]').count()==0
+                from browser import PLAYBACK_RATE_JS, VIDEO_JS
+                from core import Monitor, VideoState
+                page.set_content('<video style="width:320px;height:180px"></video>')
+                media = page.locator('video')
+                assert media.evaluate(PLAYBACK_RATE_JS, {'key': 'test', 'rate': 2})['actual'] == 2
+                assert media.evaluate(VIDEO_JS)['playback_rate'] == 2
+                monitor = Monitor()
+                assert monitor.step(VideoState('test', 0, 2, False, False, playback_rate=2), 0) == 'wait'
+                assert monitor.step(VideoState('test', 2, 2, True, True, playback_rate=2), 1) == 'finished'
                 browser.close()
             store = Store(Path(directory) / 'progress.sqlite3')
             assert store.rows() == []
             store.close()
-            Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'version': '1.6.4', 'tk': tk.TkVersion,
-                                                   'playwright_driver': True,
-                                                   'api_key_encryption': True,
-                                                   'speech_key_encryption': True,
-                                                   'multimedia_modules': True,
-                                                   'windows_ocr': True,
-                                                   'background_settings': True,
-                                                   'sqlite': True}), encoding='utf-8')
+            Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'version': '1.6.48', 'tk': tk.TkVersion,
+                'playwright_driver': True, 'api_key_encryption': True, 'speech_key_encryption': True,
+                'multimedia_modules': True, 'screenshot_without_ocr': True,
+                'scrolled_iframe_screenshot': True, 'choice_binding': True,
+                'background_settings': True, 'playback_speed': True, 'cross_check_settings': True,
+                'doubao_module': True, 'review_provider_settings': True, 'pause_answer_report': True,
+                'video_pause_hides_quiz_report': True,
+                'sqlite': True}), encoding='utf-8')
         root.destroy()
         return
     App(root, app_data_dir())

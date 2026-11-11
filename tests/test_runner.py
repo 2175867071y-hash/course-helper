@@ -64,6 +64,43 @@ class CourseAdapter:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_quiz_pause_context_does_not_leak_to_next_video(self):
+        from activities import Activity, CourseActivities
+        from gui_backend import Bridge
+
+        class PausedVideo(CourseAdapter):
+            def guard(self, include_course=True):
+                return None
+
+            def videos(self):
+                return [SimpleNamespace(state=VideoState('new-video', 1, 800, True, False))]
+
+            def play(self, video):
+                raise ManualRequired('请点击视频播放')
+
+        prompts = []
+
+        class AnsweringBridge(Bridge):
+            def emit(self, kind, **payload):
+                super().emit(kind, **payload)
+                if kind == 'prompt':
+                    prompts.append(payload)
+                    self.reply(payload['request_id'], 'r' if len(prompts) == 1 else 'q')
+
+        adapter = PausedVideo()
+        bridge = AnsweringBridge()
+        activities = CourseActivities(adapter, auto_quiz=False, control=bridge)
+        quiz = Activity('quiz', 'q1', None, None)
+        with StoreFixture() as store, \
+             patch.object(activities, '_detect', side_effect=[quiz, None]):
+            result = run_task(adapter, Task('context', 'chaoxing', URL1), store,
+                              0, 90, control=bridge, activities=activities)
+        self.assertEqual(result, 'q')
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[0].get('context'), 'quiz')
+        self.assertEqual(prompts[1].get('context', ''), '')
+        self.assertIn('视频', prompts[1]['message'])
+
     def test_zero_limit_allows_two_consecutive_videos(self):
         adapter = MixedCourse(['video1', 'video2'])
         result, store = self.run_mixed(adapter)
@@ -239,6 +276,101 @@ class RunnerTests(unittest.TestCase):
             except ManualRequired:
                 pass
         self.assertEqual(clicks, [], '平台已经切节时不能再点击而跳过视频')
+
+    def test_advance_activity_result_page_new_key_still_advances(self):
+        # 交卷后题目指纹变化会产生新的 key；只要新 key 已完成（同一份试卷的结果页），
+        # 就继续切下一节，而不是误判成“页面已自动切换”。
+        adapter = Adapter(CoursePage(), 'chaoxing')
+        clicks = []
+        def click(**kwargs):
+            clicks.append(1)
+            adapter.page.url = URL2
+        adapter.guard = lambda include_course=True: None
+        adapter.task_pending = lambda: False
+        adapter.next_control = lambda: SimpleNamespace(click=click)
+        adapter.videos = lambda: []
+        adapter.switch_activity_tab = lambda old_key, timeout=30: None
+        adapter._task_pending_settled = lambda seconds=10: False
+        adapter.activity_identity = lambda: 'new-quiz-key'
+        adapter.activity_completed = lambda key: key == 'new-quiz-key'
+        adapter.advance_activity('old-quiz-key', timeout=1)
+        self.assertEqual(clicks, [1], '结果页的新 key 不应阻止切下一节')
+        self.assertEqual(adapter.page.url, URL2)
+
+    def test_retry_after_stalled_activity_tab_never_leaves_the_section(self):
+        for source in ('video', 'document'):
+            for tab_response in (False, True):
+                with self.subTest(source=source, tab_response=tab_response):
+                    adapter = Adapter(CoursePage(), 'chaoxing')
+                    chapter_clicks, tab_clicks = [], []
+                    adapter.guard = lambda **kwargs: None
+                    adapter.task_pending = lambda: False
+                    adapter.next_control = lambda: SimpleNamespace(click=lambda **kw: chapter_clicks.append(1))
+                    adapter.switch_activity_tab = lambda *args: tab_clicks.append(1) or tab_response
+                    if source == 'video':
+                        adapter.activity_identity = lambda: ''
+                        adapter.videos = lambda: [SimpleNamespace(state=VideoState(source, 5, 5, True, True))]
+                        advance = adapter.advance
+                    else:
+                        adapter.activity_identity = lambda: source
+                        adapter.videos = lambda: []
+                        advance = adapter.advance_activity
+                    for _ in range(2):
+                        try:
+                            advance(source, timeout=0)
+                        except ManualRequired:
+                            pass
+                    self.assertEqual(tab_clicks, [1])
+                    self.assertEqual(chapter_clicks, [], '仍显示上一活动时不能跳过本节小测')
+
+    def test_advance_activity_unfinished_new_key_returns_without_click(self):
+        adapter = Adapter(CoursePage(), 'chaoxing')
+        clicks = []
+        adapter.guard = lambda include_course=True: None
+        adapter.task_pending = lambda: False
+        adapter.next_control = lambda: SimpleNamespace(click=lambda **kwargs: clicks.append(1))
+        adapter.videos = lambda: []
+        adapter.activity_identity = lambda: 'brand-new-activity'
+        adapter.activity_completed = lambda key: False
+        adapter.advance_activity('old-quiz-key', timeout=1)
+        self.assertEqual(clicks, [], '未完成的新活动才表示页面已自动切换，不应再点下一节')
+
+    def test_loading_errors_retry_within_window_without_manual(self):
+        # 交卷/切节后页面跳转时读取超时，应在窗口内自动重试，而不是打断。
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+        adapter = CourseAdapter()
+        calls = []
+        def videos():
+            calls.append(1)
+            if len(calls) <= 3:
+                raise PlaywrightTimeout('execution context was destroyed')
+            current = min(len(calls) - 4, 2)
+            return [SimpleNamespace(state=VideoState('v', current, 2,
+                                                     current == 2, current == 2))]
+        adapter.videos = videos
+        store = Store(':memory:')
+        self.addCleanup(store.close)
+        clock = itertools.count()
+        with patch('main.time.monotonic', side_effect=lambda: next(clock)), \
+             patch('main.time.sleep'), patch('main.ask_manual', return_value='q') as manual:
+            result = run_task(adapter, Task('loading', 'chaoxing', URL1, 1), store, 1, 90)
+        self.assertEqual(result, 'limit', '短暂加载超时应自动重试后继续')
+        manual.assert_not_called()
+
+    def test_loading_errors_beyond_window_prompt_manual(self):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+        adapter = CourseAdapter()
+        def videos():
+            raise PlaywrightTimeout('execution context was destroyed')
+        adapter.videos = videos
+        store = Store(':memory:')
+        self.addCleanup(store.close)
+        clock = itertools.count()
+        with patch('main.time.monotonic', side_effect=lambda: next(clock)), \
+             patch('main.time.sleep'), patch('main.ask_manual', return_value='q') as manual:
+            result = run_task(adapter, Task('loading', 'chaoxing', URL1, 1), store, 1, 90)
+        self.assertEqual(result, 'q', '持续加载超时最终仍需人工处理')
+        manual.assert_called_once()
 
 
 class StoreFixture:

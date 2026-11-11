@@ -9,8 +9,9 @@ import sys
 import time
 
 from browser import Adapter, ManualRequired, only_one, page_identity
-from core import Monitor, Store, validate_url
-from dom_read import safe_error_location
+from core import BROWSER_ARGS, Monitor, Store, validate_url
+from dom_read import is_loading_error, safe_error_location
+from quiz_ai import QuizDisagreement
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -59,14 +60,15 @@ def load_tasks(path):
     return result
 
 
-def ask_manual(adapter, reason, control=None):
+def ask_manual(adapter, reason, control=None, *, context=''):
     adapter.pause()
     logging.warning('%s', reason)
     if control is not None:
         choices = [('r', '已处理，继续'), ('s', '结束本课程'), ('q', '停止')]
         if isinstance(adapter, Adapter):
             choices.insert(1, ('locate', '定位目录'))
-        choice = control.ask('需要你处理一下', reason, choices)
+        options = {'context': context} if context else {}
+        choice = control.ask('需要你处理一下', reason, choices, **options)
         if choice == 'locate':
             adapter.navigator.configure(control)
             choice = 'r'
@@ -92,15 +94,30 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
     previous = None
     previous_url = None
     pending_end = None
+    last_activity_url = None
     wait = control.sleep if control is not None else time.sleep
+    loading_retries = 0
 
-    def manual(reason):
+    def manual(reason, context=''):
         if control is None:
             return ask_manual(adapter, reason)
-        return ask_manual(adapter, reason, control)
+        options = {'context': context} if context else {}
+        return ask_manual(adapter, reason, control, **options)
+
+    def record_activity_page():
+        nonlocal last_activity_url, previous, previous_url, pending_end
+        previous = previous_url = pending_end = None
+        url = adapter.page.url
+        if last_activity_url != url:
+            store.save_page(task.task_id, url)
+            last_activity_url = url
+
+    if hasattr(activities, 'on_recognized'):
+        activities.on_recognized = record_activity_page
 
     try:
         while True:
+            pause_context = ''
             try:
                 if control is not None:
                     control.check()
@@ -108,7 +125,12 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                     reason = adapter.guard(include_course=False)
                     if reason:
                         raise ManualRequired(reason)
-                    activity_action = activities.process()
+                    try:
+                        activity_action = activities.process()
+                    except Exception:
+                        # 只有答题处理本身失败才附带 AI 结果；之后的切节/播放独立提示。
+                        pause_context = getattr(activities, 'pause_context', '')
+                        raise
                     if activity_action is not None:
                         # 文档/小测不能继承上一视频的结束状态或观测记录。
                         pending_end = None
@@ -116,9 +138,12 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                         monitor = Monitor(stall_seconds=stall)
                         missing_since = time.monotonic()
                         if activity_action == 'done':
-                            adapter.advance_activity(activities.identity())
+                            # 兼容只实现 identity 的旧活动处理器。
+                            key = getattr(activities, 'advance_key', None)
+                            adapter.advance_activity(key() if callable(key) else activities.identity())
                         elif activity_action != 'working':
                             raise ValueError('无法识别当前课程活动状态')
+                        loading_retries = 0
                         wait(poll)
                         continue
                 reason = adapter.guard()
@@ -130,12 +155,16 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                     if now - missing_since >= 30:
                         raise ManualRequired('30 秒内未找到可识别的视频、文档或题目。'
                                              '请打开具体内容；目录切换不正常时可使用“定位目录”。')
+                    loading_retries = 0
                     wait(poll)
                     continue
                 missing_since = now
+                if isinstance(adapter, Adapter):
+                    video = adapter.apply_playback_rate(video)
                 state = video.state
                 previous = state
                 previous_url = adapter.page.url
+                last_activity_url = None
                 if pending_end and (state.key != pending_end or not state.ended):
                     pending_end = None
                     monitor = Monitor(stall_seconds=stall)
@@ -154,6 +183,14 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                 if action == 'manual':
                     if (monitor.reason == Monitor.PAUSED_REASON
                             and isinstance(adapter, Adapter)):
+                        # 播放器拒绝所选倍速（重置为实际值）会暂停视频；先按实际速度恢复，
+                        # 不再打扰用户，也避免被失焦恢复逻辑误判成“等待切回窗口”。
+                        if adapter.rate_rejected(state.key):
+                            recovered = adapter.recover_rate_rejection(state.key, poll, control)
+                            if recovered:
+                                monitor.resume_from_pause(*recovered)
+                                wait(poll)
+                                continue
                         recovered = adapter.recover_foreground_pause(state.key, poll, control)
                         if recovered:
                             monitor.resume_from_pause(*recovered)
@@ -173,9 +210,11 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                     if task.max_chapters > 0 and completed >= task.max_chapters:
                         logging.info('达到本次视频数量上限 %s。', task.max_chapters)
                         return 'limit'
-                    # 给平台处理自然结束事件的时间；仍未完成时转人工。
+                    # 给平台处理自然结束事件的时间；本节还有“章节测验”等活动时不必等满。
                     deadline = time.monotonic() + 30
-                    while adapter.task_pending() and time.monotonic() < deadline:
+                    has_tab = getattr(adapter, 'has_activity_tab', None)
+                    while (adapter.task_pending() and time.monotonic() < deadline
+                           and not (callable(has_tab) and has_tab())):
                         reason = (adapter.guard(include_course=False) if activities is not None
                                   else adapter.guard())
                         if reason:
@@ -191,11 +230,15 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                     pending_end = None
                     monitor = Monitor(stall_seconds=stall)
                     previous = previous_url = None
+                loading_retries = 0
                 wait(poll)
+            except QuizDisagreement as exc:
+                logging.warning('%s', exc)
+                return 'ai_disagreement'
             except ManualRequired as exc:
                 if previous is not None:
                     store.save(task.task_id, previous_url, previous, 'needs_user')
-                choice = manual(str(exc))
+                choice = manual(str(exc), pause_context)
                 if choice != 'r':
                     return choice
                 monitor = Monitor(stall_seconds=stall)
@@ -208,12 +251,25 @@ def run_task(adapter, task, store, poll, stall, control=None, *, activities=None
                 if adapter.page.is_closed():
                     logging.warning('课程窗口已关闭，进度保留到最后一次观测。')
                     return 'q'
-                choice = manual(f'页面读取或操作失败（{safe_error_location(exc)}），请检查页面后继续。')
+                if is_loading_error(exc):
+                    # 提交/切节后页面跳转时读取会超时；在窗口内自动等待重试，不打断流程。
+                    loading_retries += 1
+                    if loading_retries < 5:
+                        wait(poll)
+                        continue
+                    loading_retries = 0
+                    reason = '课程页面仍在加载或切换，请稍后选择继续。'
+                else:
+                    loading_retries = 0
+                    reason = f'页面读取或操作失败（{safe_error_location(exc)}），请检查页面后继续。'
+                choice = manual(reason, pause_context)
                 if choice != 'r':
                     return choice
                 monitor = Monitor(stall_seconds=stall)
                 missing_since = time.monotonic()
     finally:
+        if hasattr(activities, 'on_recognized'):
+            activities.on_recognized = None
         adapter.pause()
 
 
@@ -284,7 +340,8 @@ def main(argv=None):
             print('请先安装依赖：py -m pip install -r requirements.txt')
             return 2
         with sync_playwright() as playwright:
-            options = {'headless': False, 'viewport': None}
+            options = {'headless': False, 'no_viewport': True,
+                       'args': list(BROWSER_ARGS)}
             if args.channel != 'chromium':
                 options['channel'] = args.channel
             try:

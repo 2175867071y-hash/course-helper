@@ -226,6 +226,26 @@ class BackgroundTests(unittest.TestCase):
                 self.assertEqual(page.evaluate('pauses'), 1, '零尺寸课件不能接管窗口事件')
                 page.close()
 
+    def test_fake_focus_applies_to_media_pages_only(self):
+        # 含视频的页面伪装 hasFocus 以绕过超星失焦轮询；无视频页面保持真实语义。
+        self.install()
+        page = self.load()
+        self.assertTrue(page.evaluate('document.hasFocus()'),
+                        '含视频页面应恒报有焦点，避免失焦轮询暂停视频')
+        blank = self.context.new_page()
+        blank.set_content('<main>无视频</main>')
+        try:
+            self.assertIsInstance(blank.evaluate('document.hasFocus()'), bool,
+                                  '无视频页面仍需返回真实的布尔焦点状态')
+        finally:
+            blank.close()
+
+    def test_fake_focus_reaches_video_in_nested_iframe(self):
+        self.install()
+        page, _ = nested_course(self.context)
+        self.assertTrue(page.evaluate('document.hasFocus()'),
+                        '视频位于嵌套 iframe 内时，顶层页面也应伪装焦点')
+
 
 class MinimizedPlaybackTests(unittest.TestCase):
     def test_nested_player_top_window_exit_then_minimize_and_manual_pause(self):

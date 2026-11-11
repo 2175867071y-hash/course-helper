@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 
@@ -107,6 +108,64 @@ class StartupContracts(unittest.TestCase):
     def test_new_chapter_can_start_even_while_prior_metadata_was_missing(self):
         self.adapter.play(self.adapter.videos()[0])
         self.page.url = 'https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=2'
+        self.adapter.play(self.adapter.videos()[0])
+        self.assertEqual(self.frame.button.clicks, 2)
+
+    def test_muted_fallback_starts_playback_when_normal_play_is_blocked(self):
+        # 浏览器拒绝有声自动播放时，静音 play() 是最后的兜底。
+        from types import SimpleNamespace
+        from browser import Adapter, VIDEO_JS
+        adapter = Adapter(DomPage(), 'chaoxing')
+        state = {'paused': True, 'current': 0}
+
+        def evaluate(expression, *args):
+            if expression == VIDEO_JS:
+                return dict(state, duration=10, ready=4)
+            if 'muted' in expression:
+                state['paused'] = False
+                return 'ok'
+            return 'blocked'
+
+        video = SimpleNamespace(
+            state=SimpleNamespace(key='k', ready=4, paused=True, slot=''),
+            locator=SimpleNamespace(evaluate=evaluate))
+        self.assertTrue(adapter._fallback_play(video))
+        self.assertFalse(state['paused'])
+
+    def test_guard_skips_controls_that_vanish_during_transition(self):
+        # 提交后页面跳转时，按钮元素会失效；guard 不能因此抛错打断整轮流程。
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from browser import Adapter
+        page = SimpleNamespace(
+            url='https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=1',
+            set_default_timeout=lambda value: None,
+            on=lambda *args: None)
+        adapter = Adapter(page, 'chaoxing')
+        broken = SimpleNamespace(evaluate=Mock(side_effect=RuntimeError('element detached')))
+
+        def locator(selector):
+            return SimpleNamespace(
+                count=lambda: 0,
+                all=lambda: [broken] if selector.startswith('[role=dialog]') else [])
+
+        frame = SimpleNamespace(
+            url='https://mooc1.chaoxing.com/ananas/modules/video/index.html',
+            frame_element=lambda: SimpleNamespace(is_visible=lambda: True),
+            locator=locator)
+        adapter.visible_frames = lambda: [frame]
+        self.assertIsNone(adapter.guard(include_course=False))
+
+    def test_paused_loaded_video_can_be_retried_after_delay(self):
+        # 视频已加载但被暂停时，间隔 10 秒后允许再点一次播放；期间不重复点击。
+        self.frame.video.data.update(source='https://media.example/video1.mp4',
+                                     duration=10, ready=4)
+        self.adapter.play(self.adapter.videos()[0])
+        self.assertEqual(self.frame.button.clicks, 1)
+        with self.assertRaises(self.manual):
+            self.adapter.play(self.adapter.videos()[0])
+        key = self.adapter.videos()[0].state.key
+        self.adapter.start_times[key] = time.monotonic() - 4
         self.adapter.play(self.adapter.videos()[0])
         self.assertEqual(self.frame.button.clicks, 2)
 

@@ -104,6 +104,29 @@ class NavigationDOMTests(unittest.TestCase):
         with self.assertRaisesRegex(ManualRequired, '锁定|不可用'):
             self.adapter.next_control()
 
+    def test_open_next_unit_then_enter_its_first_lesson_once(self):
+        self.page.set_content('''<nav aria-label="课程目录"><button aria-current="step">上一课</button>
+            <button id="unit" aria-expanded="false" aria-controls="lessons">第二单元</button>
+            <div id="lessons" hidden><button id="first">第一课</button><button>第二课</button></div>
+            </nav><main>上一课正文</main><script>
+            window.opened=0; window.entered=0;
+            unit.onclick=()=>{window.opened++; unit.setAttribute('aria-expanded','true'); lessons.hidden=false};
+            first.onclick=()=>{window.entered++;document.querySelector('[aria-current]').removeAttribute('aria-current');
+                first.setAttribute('aria-current','step'); document.querySelector('main').textContent='新课正文'};
+            </script>''')
+        target = self.adapter.navigator.next_target()
+        target.click(timeout=1500)
+        self.adapter.navigator.wait_ready(2)
+        self.assertEqual(self.page.evaluate('[window.opened, window.entered]'), [1, 1])
+
+    def test_unit_control_outside_directory_is_never_opened(self):
+        self.page.set_content('''<nav aria-label="课程目录"><button aria-current="step">上一课</button>
+            <button aria-expanded="false" aria-controls="outside" onclick="window.clicked=true">单元</button>
+            <button>下一课</button></nav><main id="outside">正文</main>''')
+        with self.assertRaises(ManualRequired):
+            self.adapter.navigator.next_target()
+        self.assertFalse(self.page.evaluate('!!window.clicked'))
+
     def test_two_catalogues_with_active_item_are_ambiguous(self):
         self.load('<nav aria-label="章节目录"><button aria-current="step">Other</button><button>Next</button></nav>')
         with self.assertRaisesRegex(ManualRequired, '多个|唯一'):
@@ -236,7 +259,8 @@ class NavigationDOMTests(unittest.TestCase):
 
     def test_generic_host_change_stops_instead_of_processing_another_site(self):
         self.page.route('https://other.test/**', lambda route: route.fulfill(body='Other'))
-        self.page.goto('https://other.test/learn')
+        # Navigation can take longer than the adapter's 1.5 s locator timeout.
+        self.page.goto('https://other.test/learn', timeout=10000)
         self.assertIn('站点', self.adapter.guard(include_course=False) or '')
 
     def test_picker_persists_and_keeps_sections_in_same_sidebar(self):
@@ -370,7 +394,7 @@ class NavigationDOMTests(unittest.TestCase):
         nav = self.adapter.navigator
         nav.start_picker()
         self.page.locator('nav button').nth(0).click()
-        self.page.reload()
+        self.page.reload(timeout=10000)
         with self.assertRaisesRegex(ManualRequired, '刷新|失效'):
             nav.finish_picker()
 

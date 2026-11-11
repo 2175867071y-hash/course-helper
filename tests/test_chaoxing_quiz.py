@@ -96,6 +96,102 @@ class ChaoxingQuizTests(unittest.TestCase):
         solve.assert_not_called()
         self.assertIsNone(self.frame.locator('button').get_attribute('data-count'))
 
+    def test_ocr_failure_identifies_question_and_option_before_ai(self):
+        self.load(font=True)
+        def read(node):
+            if node.evaluate("e=>e.closest('.singleQuesId').previousElementSibling!==null"):
+                if node.inner_text() == '三':
+                    raise ManualRequired('有效文字识别结果不足，请手动核对。')
+            return node.inner_text()
+
+        with patch('quiz_dom.ocr_text', side_effect=read), \
+             patch('activities.solve_questions') as solve:
+            with self.assertRaisesRegex(ManualRequired, '第 2 题.*选项 2.*有效文字识别结果不足'):
+                self.course.process()
+        solve.assert_not_called()
+        self.assertIsNone(self.frame.locator('button').get_attribute('data-count'))
+
+    def test_scrolled_special_font_quiz_uses_real_ocr_and_submits_once(self):
+        self.load(font=True)
+        self.page.locator('body').evaluate("e=>e.style.overflow='hidden'")
+        self.frame.locator('body').evaluate("""e=>{
+            e.style.marginTop='850px';
+            for(const q of e.querySelectorAll('.TiMu')){
+                q.style.marginBottom='150px';
+                q.querySelector('.fontLabel').textContent='Select speech recognition technology';
+                q.querySelectorAll('a.after').forEach((a,i)=>{
+                    a.textContent=i?'Speech synthesis (TTS)':'Speech recognition (ASR)';
+                    a.style.cssText='display:block;font:28px Arial;margin:20px 0';
+                });
+            }
+        }""")
+        seen = []
+        def solve(questions, *args, **kwargs):
+            seen.extend(questions)
+            return [QuizAnswer(str(i), [0], .99) for i in range(3)]
+
+        with patch('activities.solve_questions', side_effect=solve) as ai, \
+             patch('urllib.request.urlopen', side_effect=AssertionError('no network')):
+            self.assertEqual(self.course.process(), 'working')
+            self.assertEqual(self.course.process(), 'working')
+        ai.assert_called_once()
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(all('speech recognition' in q.prompt.lower() for q in seen))
+        self.assertTrue(all('ASR' in q.options[0] and 'TTS' in q.options[1] for q in seen))
+        self.assertTrue(all(option.get_attribute('aria-checked') == 'true'
+                            for option in self.frame.locator('li:first-child').all()))
+        self.assertEqual(self.frame.locator('button').get_attribute('data-count'), '1')
+
+    def test_scroll_pane_with_wide_true_false_choices_reaches_bottom_submit(self):
+        self.load(font=True)
+        self.frame.locator('body').evaluate("""body=>{
+            const pane=document.createElement('main');
+            pane.id='answer-pane';
+            pane.style.cssText='height:430px;overflow:auto;width:950px';
+            const quiz=body.querySelector('.RightCon');
+            pane.append(quiz);body.append(pane);
+            const nav=document.createElement('aside');
+            nav.style.cssText='height:80px;overflow:auto';
+            nav.innerHTML='<div style="height:600px">Course directory</div>';
+            body.append(nav);
+            quiz.querySelectorAll('.TiMu').forEach((q,i)=>{
+                q.style.marginBottom='80px';
+                q.querySelector('.fontLabel').textContent='Select speech recognition technology';
+                q.querySelector('.fontLabel').style.cssText='font:20px Arial';
+                q.querySelectorAll('a.after').forEach((a,n)=>{
+                    a.textContent=i===2 ? (n?'错':'对') :
+                        (n?'Speech synthesis (TTS)':'Speech recognition (ASR)');
+                    a.style.cssText='display:block;width:800px;font:20px Microsoft YaHei;line-height:40px';
+                });
+            });
+            const old=quiz.querySelector('button');
+            old.outerHTML='<div style="height:700px"></div>'+ 
+                '<a role="button" id="save">暂时保存</a> '+
+                '<a role="button" id="submit">提交</a>';
+            for(const id of ['save','submit']){
+                quiz.querySelector('#'+id).onclick=e=>{
+                    e.currentTarget.dataset.count=+(e.currentTarget.dataset.count||0)+1;
+                };
+            }
+        }""")
+        self.assertGreater(self.frame.locator('#submit').evaluate(
+            "e=>e.getBoundingClientRect().top"), 430)
+        seen = []
+        def solve(questions, *args, **kwargs):
+            seen.extend(questions)
+            return [QuizAnswer(str(i), [0], .99) for i in range(3)]
+        with patch('activities.solve_questions', side_effect=solve) as ai, \
+             patch('urllib.request.urlopen', side_effect=AssertionError('no network')):
+            self.assertEqual(self.course.process(), 'working')
+            self.assertEqual(self.course.process(), 'working')
+        self.assertEqual(seen[2].options, ['对', '错'])
+        self.assertEqual(seen[2].kind, 'truefalse')
+        ai.assert_called_once()
+        self.assertEqual(self.frame.locator('#submit').get_attribute('data-count'), '1')
+        self.assertIsNone(self.frame.locator('#save').get_attribute('data-count'))
+        self.assertGreater(self.frame.locator('#answer-pane').evaluate('e=>e.scrollTop'), 700)
+        self.assertEqual(self.frame.locator('aside').evaluate('e=>e.scrollTop'), 0)
+
     def test_observed_option_text_is_stable_when_aria_label_changes(self):
         from quiz_dom import option_text
         self.load()
@@ -184,6 +280,22 @@ class ChaoxingQuizTests(unittest.TestCase):
 
 
 class LocalOCRTests(unittest.TestCase):
+    def test_wide_single_character_options_are_read_after_scrolling(self):
+        from quiz_ocr import read_text
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(channel='msedge', headless=True)
+            try:
+                page = browser.new_page()
+                for text in ('对', '错'):
+                    with self.subTest(text=text):
+                        page.set_content('<div style="height:900px"></div>'
+                            '<a style="display:block;width:900px;font:20px Microsoft YaHei;'
+                            f'line-height:40px">{text}</a><div style="height:300px"></div>')
+                        self.assertEqual(read_text(page.locator('a')), text)
+                        self.assertGreater(page.evaluate('scrollY'), 0)
+            finally:
+                browser.close()
+
     def test_windows_ocr_reads_rendered_chinese_without_network(self):
         from quiz_ocr import read_text
         with sync_playwright() as pw:
@@ -225,6 +337,25 @@ class LocalOCRTests(unittest.TestCase):
                         else:
                             self.assertEqual(result, text)
             browser.close()
+
+    def test_small_character_with_partial_ocr_is_not_accepted_as_another_character(self):
+        from quiz_ocr import read_text
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(channel='msedge', headless=True)
+            try:
+                page = browser.new_page()
+                for line_height in ('normal', '32px'):
+                    with self.subTest(line_height=line_height):
+                        page.set_content('<span style="font:14px Microsoft YaHei;'
+                                         f'line-height:{line_height}">错</span>')
+                        try:
+                            result = read_text(page.locator('span'))
+                        except ManualRequired as error:
+                            self.assertIn('文字识别', str(error))
+                        else:
+                            self.assertEqual(result, '错')
+            finally:
+                browser.close()
 
     def test_scrollable_text_inside_target_stops_before_ocr(self):
         from quiz_ocr import read_text

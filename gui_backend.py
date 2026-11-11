@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 import queue
 import threading
+import time
+from urllib.parse import urlsplit
 
-from browser import Adapter, install_background_playback
-from core import Store, validate_url
+from browser import Adapter, ManualRequired, install_background_playback
+from core import BROWSER_ARGS, Store, detect_platform, validate_url, validate_playback_rate
 from main import START, Task, run_task
 
 
@@ -38,6 +40,10 @@ class GuiRequest:
     speech_model: str = ''
     speech_api_key: str = field(default='', repr=False)
     background_playback: bool = True
+    playback_rate: float = 2.0
+    quiz_cross_check: bool = True
+    ai_review_model: str = ''
+    quiz_review_provider: str = '豆包网页'
 
 
 class Bridge:
@@ -70,7 +76,7 @@ class Bridge:
         with self._condition:
             self._condition.notify_all()
 
-    def ask(self, title, message, choices):
+    def ask(self, title, message, choices, *, context=''):
         with self._condition:
             self.check()
             self._serial += 1
@@ -79,7 +85,7 @@ class Bridge:
             self._answer = None
             self._allowed = {key for key, _ in choices}
             self.emit('prompt', request_id=request_id, title=title,
-                      message=message, choices=choices)
+                      message=message, choices=choices, context=context)
             try:
                 while self._answer is None:
                     self.check()
@@ -241,6 +247,67 @@ def choose_page(context, platform, bridge):
         return pages[int(answer)][0]
 
 
+def _entry_kind(adapter):
+    from activities import CourseActivities, DOC_SELECTOR, DOC_PATH
+    from quiz_screenshots import discover_groups
+
+    for frame in adapter.visible_frames():
+        if frame.locator('video:visible').count():
+            return '视频'
+        if discover_groups(frame):
+            return '小测'
+        if (any(root.is_visible() for root in frame.locator(DOC_SELECTOR).all())
+                or (DOC_PATH.search(urlsplit(frame.url).path) and frame.locator('body').is_visible())):
+            return '文档'
+        # 目录页的 main 经常只有课程链接或简介，不能当作第一篇阅读。
+        for root in CourseActivities._static_roots(frame):
+            if root.locator('nav, [role=navigation], a[href]').count():
+                continue
+            if root.evaluate("e => e.tagName === 'ARTICLE'") or adapter.navigator.identity():
+                return '阅读'
+    return ''
+
+
+def _direct_course(page, target, request, bridge):
+    """只探测本次导航的课件，登录页、目录或未知页面留给原有选页流程。"""
+    if request.command != 'run' or target == START[request.platform]:
+        return None, ''
+    from playwright.sync_api import Error
+
+    platform = detect_platform(target) if request.platform == 'generic' else request.platform
+    try:
+        validate_url(page.url, platform)
+        if platform == 'generic' and urlsplit(page.url).hostname != urlsplit(target).hostname:
+            return None, '链接跳转到了另一个站点，请核对当前页面。'
+    except ValueError:
+        return None, '链接已跳转，请检查登录状态并打开课程章节。'
+
+    adapter = Adapter(page, platform, control=bridge, playback_rate=request.playback_rate)
+    kind = ''
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            bridge.check()
+            try:
+                reason = adapter.guard(include_course=False)
+                if reason:
+                    return None, reason
+                kind = _entry_kind(adapter)
+                if kind:
+                    return adapter, kind
+            except Error:
+                # 登录重定向和 iframe 延迟挂载时会使上一轮的 DOM 暂时失效。
+                pass
+            except ManualRequired as exc:
+                return None, str(exc)
+            if page.is_closed() or time.monotonic() >= deadline:
+                return None, '尚未识别到视频、题目或阅读区。若当前是课程目录，请打开要学习的章节。'
+            bridge.sleep(0.4)
+    finally:
+        if not kind and not page.is_closed():
+            page.remove_listener('dialog', adapter._on_dialog)
+
+
 def execute(request, bridge, data_dir):
     outcome = 'error'
     error_message = None
@@ -256,16 +323,21 @@ def execute(request, bridge, data_dir):
         if type(request.max_chapters) is not int or not 0 <= request.max_chapters <= 1000:
             raise ValueError('本次视频数须为 0 到 1000 的整数，0 表示不限。')
         if any(type(value) is not bool for value in
-               (request.auto_documents, request.auto_quiz, request.quiz_submit, request.background_playback)):
+               (request.auto_documents, request.auto_quiz, request.quiz_submit,
+                request.background_playback, request.quiz_cross_check)):
             raise ValueError('文档、小测、自动提交和后台播放设置必须为启用或停用。')
         if type(request.document_seconds) is not int or not 3 <= request.document_seconds <= 120:
             raise ValueError('文档每页停留时间须为 3 到 120 秒的整数。')
+        validate_playback_rate(request.playback_rate)
         if not all(isinstance(value, str) for value in
                    (request.ai_base_url, request.ai_model, request.ai_api_key,
-                    request.vision_model, request.speech_base_url, request.speech_model, request.speech_api_key)):
+                    request.vision_model, request.speech_base_url, request.speech_model,
+                    request.speech_api_key, request.ai_review_model)):
             raise ValueError('AI 接口地址、模型和 API Key 必须为文本。')
         if request.channel not in {'msedge', 'chrome'}:
             raise ValueError('请选择 Edge 或 Chrome。')
+        if request.quiz_review_provider not in ('豆包网页', '原 API 多轮'):
+            raise ValueError('请选择豆包网页或原 API 多轮复核。')
         data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         task_lease = _claim_task(data_dir, request)
@@ -282,11 +354,14 @@ def execute(request, bridge, data_dir):
             try:
                 context = playwright.chromium.launch_persistent_context(
                     str(local_dir / f'profile-{request.channel}'), headless=False,
-                    viewport=None, channel=request.channel, timeout=20000)
+                    no_viewport=True, channel=request.channel, timeout=20000,
+                    # 只影响助手自己启动的浏览器实例。
+                    args=list(BROWSER_ARGS))
             except Exception:
                 raise RuntimeError('浏览器启动失败：请确认已安装所选浏览器，且另一个网课助手窗口没有运行同一课程。') from None
             try:
                 bridge.check()
+                logging.info('浏览器已启动：自动播放策略=无需用户手势')
                 background_ready = False
                 if request.command == 'run':
                     background_ready = install_background_playback(context, request.background_playback)
@@ -297,19 +372,25 @@ def execute(request, bridge, data_dir):
                     bridge.check()
                     bridge.emit('log', message='页面尚未加载完成，请在浏览器中检查网络或手动打开课程。')
                 bridge.check()
-                answer = bridge.ask('打开课程后，再继续',
-                                    '请在刚打开的浏览器中手动登录，进入要学习的具体课程章节。'
-                                    '\n准备好后点击下面的“我已打开课程”。'
-                                    + ('\n后台播放兼容已启用：开始后可切换软件或最小化浏览器，不能关闭浏览器。'
-                                       if background_ready else
-                                       '\n后台播放兼容未完全启用，请查看运行记录并按提示处理。'
-                                       if request.background_playback and request.command == 'run' else ''),
-                                    [('ready', '我已打开课程'), ('locate', '先定位目录'), ('cancel', '停止')])
-                if answer == 'cancel':
-                    raise Cancelled()
-                page = choose_page(context, request.platform, bridge)
+                adapter, entry = _direct_course(page, target, request, bridge)
+                answer = 'ready'
+                if adapter is None:
+                    answer = bridge.ask('打开课程后，再继续',
+                                        (entry + '\n' if entry else '') +
+                                        '请在浏览器中完成登录并打开具体章节，再点击“我已打开课程”。'
+                                        + ('\n后台播放兼容已启用，学习时可切换软件或最小化浏览器。'
+                                           if background_ready else
+                                           '\n后台播放兼容未完全启用，请查看运行记录。'
+                                           if request.background_playback and request.command == 'run' else ''),
+                                        [('ready', '我已打开课程'), ('locate', '先定位目录'), ('cancel', '停止')])
+                    if answer == 'cancel':
+                        raise Cancelled()
+                    page = choose_page(context, request.platform, bridge)
+                    adapter = Adapter(page, request.platform, control=bridge,
+                                      playback_rate=request.playback_rate if request.command == 'run' else None)
+                else:
+                    logging.info('课程链接已识别为%s，自动开始学习。', entry)
                 bridge.emit('status', message='正在检测课程页面…')
-                adapter = Adapter(page, request.platform, control=bridge)
                 adapter.navigator.load(local_dir / 'navigation.json')
                 if answer == 'locate':
                     adapter.navigator.configure(bridge)
@@ -326,6 +407,10 @@ def execute(request, bridge, data_dir):
                     bridge.emit('status', message='正在学习，进度会自动保存')
                     task = Task(request.task_id, request.platform, page.url,
                                 request.max_chapters)
+                    web_review = None
+                    if request.quiz_cross_check and request.quiz_review_provider == '豆包网页':
+                        from doubao_web import DoubaoReviewer
+                        web_review = DoubaoReviewer(playwright, data_dir, request.channel, bridge)
                     activities = CourseActivities(
                         adapter, auto_documents=request.auto_documents,
                         auto_quiz=request.auto_quiz, document_seconds=request.document_seconds,
@@ -333,9 +418,13 @@ def execute(request, bridge, data_dir):
                         ai_base_url=request.ai_base_url, ai_model=request.ai_model,
                         ai_api_key=request.ai_api_key, control=bridge, vision_model=request.vision_model,
                         speech_base_url=request.speech_base_url, speech_model=request.speech_model,
-                        speech_api_key=request.speech_api_key)
-                    outcome = run_task(adapter, task, store, 2, 90,
-                                       control=bridge, activities=activities)
+                        speech_api_key=request.speech_api_key, screenshot_quiz=True,
+                        quiz_cross_check=request.quiz_cross_check, ai_review_model=request.ai_review_model,
+                        web_review=web_review)
+                    from ocr_diagnostics import record_failures
+                    with record_failures(local_dir / 'ocr-diagnostics'):
+                        outcome = run_task(adapter, task, store, 2, 90,
+                                           control=bridge, activities=activities)
                     if outcome in {'limit', 's'}:
                         bridge.ask('本次学习已结束',
                                    '浏览器会保留，便于你核对课程页面和平台记录。'

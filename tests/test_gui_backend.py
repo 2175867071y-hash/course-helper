@@ -1,4 +1,4 @@
-"""界面线程桥接：无需联网或控制真实浏览器。"""
+﻿"""界面线程桥接：无需联网或控制真实浏览器。"""
 import queue
 import tempfile
 import threading
@@ -28,7 +28,10 @@ class BridgeTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self.finished_session(outcome)
 
-    def finished_session(self, outcome):
+    def test_running_course_stores_ocr_failure_under_its_task_directory(self):
+        self.finished_session('limit', capture_ocr=True)
+
+    def finished_session(self, outcome, capture_ocr=False):
         closed, activity_options, run_options, setup = [], [], [], []
         page = SimpleNamespace(url='https://mooc1.chaoxing.com/mycourse/studentstudy',
                                goto=lambda *args, **kwargs: setup.append('goto'), frames=[],
@@ -51,6 +54,13 @@ class BridgeTests(unittest.TestCase):
 
         def finished(*args, **kwargs):
             run_options.append(kwargs)
+            if capture_ocr:
+                from quiz_ocr import _recognize
+                from browser import ManualRequired
+                from tests.test_ocr_results import PNG, response
+                with patch('quiz_ocr.subprocess.run', return_value=response('对', '错')):
+                    with self.assertRaises(ManualRequired):
+                        _recognize(PNG)
             return outcome
 
         request = GuiRequest('run', 'chaoxing', 'course', max_chapters=2)
@@ -63,12 +73,14 @@ class BridgeTests(unittest.TestCase):
         request.ai_model = 'test-model'
         request.ai_api_key = 'test-private-key'
         request.vision_model = 'vision-model'
+        request.quiz_cross_check = outcome == 'limit'
+        request.ai_review_model = 'review-vision'
         request.speech_base_url = 'https://speech.example/v1'
         request.speech_model = 'transcribe-model'
         request.speech_api_key = 'speech-private-key'
         bridge = Bridge()
         with tempfile.TemporaryDirectory() as directory, \
-             patch.dict('sys.modules', {'playwright.sync_api': SimpleNamespace(sync_playwright=Driver),
+             patch.dict('sys.modules', {'playwright.sync_api': SimpleNamespace(sync_playwright=Driver, TimeoutError=TimeoutError),
                                        'activities': SimpleNamespace(CourseActivities=Activities)}), \
              patch('gui_backend.Adapter', return_value=SimpleNamespace(page=page,
                    navigator=SimpleNamespace(load=lambda path: None))), \
@@ -90,11 +102,22 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(activity_options[0]['document_seconds'], 12)
                 self.assertEqual(activity_options[0]['ai_model'], 'test-model')
                 self.assertEqual(activity_options[0]['vision_model'], 'vision-model')
+                self.assertEqual(activity_options[0]['quiz_cross_check'], outcome == 'limit')
+                self.assertEqual(activity_options[0]['ai_review_model'], 'review-vision')
+                self.assertTrue(activity_options[0]['screenshot_quiz'])
                 self.assertEqual(activity_options[0]['speech_base_url'], 'https://speech.example/v1')
                 self.assertEqual(activity_options[0]['speech_model'], 'transcribe-model')
                 self.assertEqual(activity_options[0]['speech_api_key'], 'speech-private-key')
                 self.assertEqual(activity_options[0]['quiz_submit'], outcome == 'limit')
                 self.assertIsInstance(run_options[0]['activities'], Activities)
+                if capture_ocr:
+                    from gui_backend import task_directory
+                    from zipfile import ZipFile
+                    import json
+                    path = task_directory(directory, request) / 'ocr-diagnostics' / 'ocr-failure.zip'
+                    with ZipFile(path) as archive:
+                        report = json.loads(archive.read('report.json'))
+                        self.assertEqual(report['readings'], ['对', '错'])
             finally:
                 bridge.stop()
                 worker.join(timeout=2)
@@ -206,7 +229,7 @@ class BridgeTests(unittest.TestCase):
 
         bridge = Bridge(queue.Queue())
         with tempfile.TemporaryDirectory() as directory:
-            with patch.dict('sys.modules', {'playwright.sync_api': SimpleNamespace(sync_playwright=Driver)}):
+            with patch.dict('sys.modules', {'playwright.sync_api': SimpleNamespace(sync_playwright=Driver, TimeoutError=TimeoutError)}):
                 worker = threading.Thread(target=execute, args=(
                     GuiRequest('run', 'chaoxing', 'course'), bridge, Path(directory)))
                 worker.start()

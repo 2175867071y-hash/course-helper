@@ -16,6 +16,13 @@ except ModuleNotFoundError as exc:
     core = None
 
 
+class BrowserLaunchTests(unittest.TestCase):
+    def test_autoplay_is_allowed_without_user_gesture(self):
+        # 课程视频常要求真实用户手势才允许播放；启动参数里必须带这个开关。
+        from core import BROWSER_ARGS
+        self.assertIn('--autoplay-policy=no-user-gesture-required', BROWSER_ARGS)
+
+
 class CoreTestCase(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(core, "core.py 尚未实现")

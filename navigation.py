@@ -37,14 +37,23 @@ const path = e => {
 };
 const rowsFor = (root,selector) => [...root.querySelectorAll(selector)].filter(visible)
   .filter(e=> ![...e.querySelectorAll(selector)].some(visible));
+const groupInfo = (root,e) => {
+  if (!e.matches('button[aria-expanded],[role=button][aria-expanded],[role=treeitem][aria-expanded]')) return null;
+  const id=(e.getAttribute('aria-controls')||'').trim();
+  const panels=id && !/\s/.test(id) ? document.querySelectorAll('#'+CSS.escape(id)) : [];
+  const panel=panels.length===1 && panels[0]!==root && root.contains(panels[0]) && !panels[0].contains(e) ? panels[0] : null;
+  return {expanded:e.getAttribute('aria-expanded')==='true',panel:panel ? path(panel) : ''};
+};
 const describe = (root,selector,selection=null) => {
   const rows=rowsFor(root,selector);
   const selected=rows.map((e,i)=>(selection ?
     getComputedStyle(e).getPropertyValue(selection.property)===selection.value : active(e))?i:-1).filter(i=>i>=0);
-  if (!rows.length || selected.length!==1) return null;
-  return {root:path(root), selector, current:selected[0],
+  // 分组标题和它下面的当前项可能同时带高亮，只保留最内层的那一项。
+  const chosen=selected.length>1 ? selected.filter(i=>!selected.some(j=>j!==i&&rows[i].contains(rows[j]))) : selected;
+  if (!rows.length || chosen.length!==1) return null;
+  return {root:path(root), selector, current:chosen[0],
     items:rows.map(e=>({path:path(e), text:(e.innerText||e.getAttribute('aria-label')||'').trim().slice(0,160),
-      href:e.closest('a')?.href || e.querySelector('a')?.href || '',
+      href:e.closest('a')?.href || e.querySelector('a')?.href || '', group:groupInfo(root,e),
       disabled:e.matches(':disabled') || e.getAttribute('aria-disabled')==='true' ||
         /(^|[\s_-])(disabled|locked)([\s_-]|$)/i.test(e.className || '')}))};
 };
@@ -267,7 +276,14 @@ class Navigator:
                 if origin(self.rule['page']) != origin(self.adapter.page.url) or origin(self.rule['frame']) != origin(frame.url):
                     continue
                 rule = self.rule
-            for item in frame.evaluate(CATALOG_JS, rule):
+            try:
+                items = frame.evaluate(CATALOG_JS, rule)
+            except Exception as exc:
+                if is_loading_error(exc):
+                    from browser import ManualRequired
+                    raise ManualRequired('课程目录仍在加载，请稍后选择继续。') from None
+                raise
+            for item in items:
                 item['frame'] = frame
                 found.append(item)
         if len(found) > 1:
@@ -291,6 +307,35 @@ class Navigator:
         if index >= len(item['items']):
             self.fail('已到当前展开目录的末项。请核对是否还有折叠单元或未完成内容，再选择结束本课程。')
         target = item['items'][index]
+        opened = set()
+        while target.get('group'):
+            group = target['group']
+            if target['disabled'] or not group['panel'] or target['path'] in opened:
+                self.fail('无法确定下一单元的可用课件，请在课程目录展开该单元。')
+            opened.add(target['path'])
+            frame, root = item['frame'], item['root']
+            if not group['expanded']:
+                self.adapter.check_navigation_url(target['href'])
+                frame.locator(target['path']).click(timeout=3000)
+            panel = frame.locator(group['panel'])
+            try:
+                panel.locator(f":is({item['selector']}):visible").first.wait_for(state='visible', timeout=3000)
+            except Exception as exc:
+                if type(exc).__name__ != 'TimeoutError':
+                    raise
+                self.fail('下一单元已展开，但其中的课件尚未出现。')
+            updated = self.state()
+            if (not updated or updated['frame'] != frame or updated['root'] != root
+                    or updated['items'][updated['current']]['path'] != item['items'][item['current']]['path']):
+                self.fail('展开单元时目录位置改变，请检查当前课件。')
+            item = updated
+            index = panel.evaluate('(panel, rows) => rows.findIndex(row => panel.contains(document.querySelector(row.path)))',
+                                   item['items'])
+            if index < 0:
+                self.fail('展开的单元里未找到可进入的课件。')
+            if index <= item['current']:
+                self.fail('展开的单元没有位于当前课程之后的课件。')
+            target = item['items'][index]
         if target['disabled']:
             self.fail('目录中的下一项已锁定或不可用，请先检查本节的完成要求。')
         self.adapter.check_navigation_url(target['href'])
